@@ -1,0 +1,68 @@
+[build-system]
+requires = ["hatchling>=1.25"]
+build-backend = "hatchling.build"
+
+[project]
+name = "conformal-ts"
+dynamic = ["version"]
+description = "Conformal prediction for time series forecasting"
+readme = "README.md"
+requires-python = ">=3.10"
+license = "BSD-3-Clause"
+authors = [{ name = "Marco Peixeiro", email = "peixmarco@gmail.com" }]
+keywords = ["conformal-prediction", "time-series", "forecasting", "uncertainty"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: BSD License",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Scientific/Engineering",
+]
+dependencies = [
+    "numpy>=1.24",
+    "pandas>=2.0",
+    "scipy>=1.11",
+]
+
+[project.optional-dependencies]
+nixtla = ["statsforecast>=1.7", "mlforecast>=0.13", "neuralforecast>=2.0"]
+darts = ["darts>=0.30"]
+sktime = ["sktime>=0.30"]
+plotting = ["matplotlib>=3.7"]
+all = ["conformal-ts[nixtla,darts,sktime,plotting]"]
+
+[project.urls]
+Homepage = "https://github.com/marcopeix/conformal-ts"
+Documentation = "https://conformal-ts.readthedocs.io"
+Repository = "https://github.com/marcopeix/conformal-ts"
+Issues = "https://github.com/marcopeix/conformal-ts/issues"
+
+[dependency-groups]
+dev = [
+    "pytest>=8",
+    "pytest-cov",
+    "ruff",
+    "mypy",
+    "pre-commit",
+]
+docs = [
+    "mkdocs-material",
+    "mkdocstrings[python]",
+]
+
+[tool.hatch.version]
+path = "src/conformal_ts/__init__.py"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/conformal_ts"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-v --cov=conformal_ts --cov-report=term-missing"
