@@ -85,3 +85,33 @@ class SupportsBootstrap(ABC):
         Forecast, shape (n_series, n_bootstraps, horizon)
         """
         ...
+
+
+class SupportsCrossValidation(ABC):
+    """Adapter can run rolling-origin cross-validation natively."""
+
+    @abstractmethod
+    def cross_validate(
+        self,
+        n_windows: int,
+        step_size: int,
+        refit: bool | int = False,
+    ) -> tuple[Forecast, Forecast]:
+        """
+        Run rolling-origin cross-validation on the adapter's training data.
+
+        Parameters
+        ----------
+        n_windows : int
+            Number of evaluation windows.
+        step_size : int
+            Number of time steps between successive windows.
+        refit : bool or int
+            Whether (or how often) to refit the model between windows.
+
+        Returns
+        -------
+        predictions : Forecast, shape (n_series, n_windows, horizon)
+        truths : Forecast, shape (n_series, n_windows, horizon)
+        """
+        ...
