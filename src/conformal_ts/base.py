@@ -158,7 +158,18 @@ class ScoreFunction(ABC):
 
     def fit(self, prediction: Forecast, truth: Forecast) -> None:
         """
-        Fit any parameters of the score function. Default: no-op.
+        Fit any internal parameters of the score function (e.g. scale
+        estimates for normalised residuals). Default: no-op.
+
+        Called by :meth:`ConformalMethod.calibrate` **before** the first
+        call to :meth:`score` on the calibration data, so implementations
+        can assume that ``prediction`` and ``truth`` are the full
+        calibration arrays.
+
+        Parameters
+        ----------
+        prediction : Forecast, shape (n_series, n_samples, horizon)
+        truth : Forecast, shape (n_series, n_samples, horizon)
         """
         return None
 
@@ -170,10 +181,26 @@ class ScoreFunction(ABC):
 
 @dataclass
 class CalibrationResult:
-    """Returned by `ConformalMethod.calibrate`."""
+    """Returned by ``ConformalMethod.calibrate``.
+
+    Attributes
+    ----------
+    n_calibration_samples : int
+        Number of calibration windows used.
+    score_quantile : NDArray[np.floating]
+        Nonconformity-score quantile(s) used for interval construction.
+        Shape is method-dependent:
+
+        * Split CP: ``(n_series, horizon)`` — one quantile per
+          (series, horizon step) pair.
+        * Online methods (ACI, AgACI, …): may be a scalar or
+          ``(n_series,)`` that evolves via ``update()``.
+    diagnostics : dict
+        Method-specific diagnostics (e.g. quantile level, learning rate).
+    """
 
     n_calibration_samples: int
-    score_quantile: NDArray[np.floating]  # shape (n_series, horizon)
+    score_quantile: NDArray[np.floating]
     diagnostics: dict
 
 
@@ -251,6 +278,10 @@ class ConformalMethod(ABC):
     ) -> CalibrationResult:
         """
         Fit the conformal correction on a calibration set.
+
+        Implementations **must** call ``self.score_fn.fit(predictions, truths)``
+        before ``self.score_fn.score(...)`` so that score functions which need
+        fitted parameters (e.g. normalised residuals) are initialised.
 
         Parameters
         ----------
