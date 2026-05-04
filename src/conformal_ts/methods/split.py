@@ -16,7 +16,9 @@ from ..base import (
     PredictionResult,
     ScoreFunction,
     Series,
+    UnsupportedCapability,
 )
+from ..capabilities import SupportsCrossValidation
 from ..nonconformity.absolute import AbsoluteResidual
 
 
@@ -51,18 +53,38 @@ class SplitConformal(ConformalMethod):
 
     def calibrate(
         self,
-        histories: list[Series],
-        truths: Forecast,
+        histories: list[Series] | None = None,
+        truths: Forecast | None = None,
+        *,
+        n_windows: int | None = None,
+        step_size: int = 1,
+        refit: bool | int = False,
     ) -> CalibrationResult:
         """
         Fit the conformal correction on a calibration set.
 
+        Two calling conventions:
+
+        * Pass ``histories`` and ``truths`` (works with any adapter).
+        * Pass ``n_windows`` (and optionally ``step_size`` / ``refit``) to
+          delegate to ``forecaster.cross_validate``. Requires
+          :class:`SupportsCrossValidation`. This is the fast path for
+          libraries with native CV (StatsForecast, MLForecast, …) — one
+          library-native call instead of N separate forecast calls.
+
         Parameters
         ----------
-        histories : list of Series, each shape (n_series, T)
-            History windows available at each calibration timestep.
-        truths : Forecast, shape (n_series, len(histories), horizon)
-            Ground truth values for each calibration history and horizon.
+        histories : list of Series, optional
+            Each shape ``(n_series, T)``. Required if ``n_windows`` is None.
+        truths : Forecast, optional
+            Shape ``(n_series, len(histories), horizon)``. Required if
+            ``n_windows`` is None.
+        n_windows : int, optional
+            Number of CV windows.
+        step_size : int
+            Step size between CV windows.
+        refit : bool or int
+            Whether to refit between CV windows.
 
         Returns
         -------
@@ -74,17 +96,28 @@ class SplitConformal(ConformalMethod):
             If the number of calibration samples is too small for the
             requested ``alpha``. At least ``ceil(1 / alpha)`` samples are
             required for the quantile to be well-defined.
+        UnsupportedCapability
+            If ``n_windows`` is provided but the adapter does not implement
+            :class:`SupportsCrossValidation`.
+        ValueError
+            If neither ``(histories, truths)`` nor ``n_windows`` is provided,
+            or if both are.
         """
-        n_cal = len(histories)
+        predictions, truths = self._collect_calibration_data(
+            histories=histories,
+            truths=truths,
+            n_windows=n_windows,
+            step_size=step_size,
+            refit=refit,
+        )
+        n_cal = predictions.shape[1]
+
         min_samples = math.ceil(1.0 / self.alpha)
         if n_cal < min_samples:
             raise CalibrationError(
                 f"Need at least ceil(1/alpha) = {min_samples} calibration "
                 f"samples for alpha={self.alpha}, got {n_cal}."
             )
-
-        # Produce forecasts for every calibration history: (n_series, n_cal, horizon)
-        predictions = self.forecaster.predict_batch(histories)
 
         # Let the score function fit any internal parameters (no-op for AbsoluteResidual)
         self.score_fn.fit(predictions, truths)
@@ -95,16 +128,46 @@ class SplitConformal(ConformalMethod):
         # Empirical quantile level with finite-sample correction
         quantile_level = min((math.ceil((1 - self.alpha) * (n_cal + 1)) / n_cal), 1.0)
 
-        # Quantile per (series, horizon): (n_series, horizon)
-        self._score_quantile: NDArray[np.floating] = np.quantile(scores, quantile_level, axis=1)
+        # Fitted state lives on self (sklearn convention: trailing underscore).
+        self.score_quantile_: NDArray[np.floating] = np.quantile(scores, quantile_level, axis=1)
+        self.n_calibration_samples_: int = n_cal
+        self.is_calibrated_ = True
 
-        self._is_calibrated = True
-
+        # CalibrationResult is a snapshot — defensively copy mutable arrays so the
+        # caller's record can't be mutated by future update() calls.
         return CalibrationResult(
             n_calibration_samples=n_cal,
-            score_quantile=self._score_quantile,
+            score_quantile=self.score_quantile_.copy(),
             diagnostics={"quantile_level": quantile_level},
         )
+
+    def _collect_calibration_data(
+        self,
+        histories: list[Series] | None,
+        truths: Forecast | None,
+        n_windows: int | None,
+        step_size: int,
+        refit: bool | int,
+    ) -> tuple[Forecast, Forecast]:
+        """Resolve calibration predictions and truths from either input form."""
+        if n_windows is not None:
+            if histories is not None or truths is not None:
+                raise ValueError("Provide either (histories, truths) or n_windows, not both.")
+            if not isinstance(self.forecaster, SupportsCrossValidation):
+                raise UnsupportedCapability(
+                    f"calibrate(n_windows=...) requires an adapter implementing "
+                    f"SupportsCrossValidation. Got {type(self.forecaster).__name__}. "
+                    "Pass explicit (histories, truths) instead."
+                )
+            return self.forecaster.cross_validate(
+                n_windows=n_windows, step_size=step_size, refit=refit
+            )
+
+        if histories is None or truths is None:
+            raise ValueError("Must provide either (histories, truths) or n_windows.")
+        # Loop fallback: one forecast per history.
+        predictions = self.forecaster.predict_batch(histories)
+        return predictions, truths
 
     def predict(self, history: Series) -> PredictionResult:
         """
@@ -125,11 +188,11 @@ class SplitConformal(ConformalMethod):
         CalibrationError
             If called before :meth:`calibrate`.
         """
-        if not self._is_calibrated:
+        if not self.is_calibrated_:
             raise CalibrationError("predict() called before calibrate(). Call calibrate() first.")
 
         point: Forecast = self.forecaster.predict(history)
-        interval: Interval = self.score_fn.invert(point, self._score_quantile)
+        interval: Interval = self.score_fn.invert(point, self.score_quantile_)
 
         return PredictionResult(
             point=point,

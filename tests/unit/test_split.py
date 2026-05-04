@@ -6,7 +6,7 @@ import numpy as np
 import pytest
 
 from conformal_ts.adapters.callable import CallableAdapter
-from conformal_ts.base import CalibrationError
+from conformal_ts.base import CalibrationError, UnsupportedCapability
 from conformal_ts.methods.split import SplitConformal
 
 
@@ -190,3 +190,60 @@ class TestInvalidAlpha:
         adapter, _ = _make_adapter(1, 1)
         with pytest.raises(ValueError, match="alpha"):
             SplitConformal(adapter, alpha=alpha)
+
+
+class TestCalibrateDispatch:
+    """calibrate() input validation across the two calling conventions."""
+
+    def test_no_args_raises(self) -> None:
+        adapter, _ = _make_adapter(1, 1)
+        method = SplitConformal(adapter, alpha=0.1)
+        with pytest.raises(ValueError, match="histories"):
+            method.calibrate()
+
+    def test_both_paths_raises(self) -> None:
+        adapter, rng = _make_adapter(1, 1)
+        method = SplitConformal(adapter, alpha=0.1)
+        histories = [rng.standard_normal((1, 10)) for _ in range(50)]
+        truths = rng.standard_normal((1, 50, 1))
+        with pytest.raises(ValueError, match="not both"):
+            method.calibrate(histories, truths, n_windows=10)
+
+    def test_n_windows_without_cv_support_raises(self) -> None:
+        # CallableAdapter does not implement SupportsCrossValidation.
+        adapter, _ = _make_adapter(1, 1)
+        method = SplitConformal(adapter, alpha=0.1)
+        with pytest.raises(UnsupportedCapability, match="SupportsCrossValidation"):
+            method.calibrate(n_windows=20)
+
+
+class TestFittedState:
+    """sklearn-style fitted state on the instance is canonical."""
+
+    def test_fitted_attributes_set_after_calibrate(self) -> None:
+        adapter, rng = _make_adapter(2, 3)
+        method = SplitConformal(adapter, alpha=0.1)
+
+        assert method.is_calibrated_ is False
+
+        histories = [rng.standard_normal((2, 30)) for _ in range(50)]
+        truths = rng.standard_normal((2, 50, 3))
+        method.calibrate(histories, truths)
+
+        assert method.is_calibrated_ is True
+        assert method.score_quantile_.shape == (2, 3)
+        assert method.n_calibration_samples_ == 50
+
+    def test_calibration_result_is_a_snapshot(self) -> None:
+        """Mutating the returned CalibrationResult does not affect instance state."""
+        adapter, rng = _make_adapter(1, 2)
+        method = SplitConformal(adapter, alpha=0.1)
+
+        histories = [rng.standard_normal((1, 30)) for _ in range(50)]
+        truths = rng.standard_normal((1, 50, 2))
+        cal = method.calibrate(histories, truths)
+
+        original = method.score_quantile_.copy()
+        cal.score_quantile[...] = 999.0  # mutate the snapshot
+
+        np.testing.assert_array_equal(method.score_quantile_, original)

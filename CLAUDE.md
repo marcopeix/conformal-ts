@@ -106,6 +106,20 @@ boundary so methods never see framework types.
 5. Tests in `tests/unit/test_<name>.py` covering: coverage, shape (with
    `n_series` in {1, 5} and `horizon` in {1, 12}), determinism, and capability errors.
 
+## State conventions on ConformalMethod instances
+
+Following sklearn's convention:
+
+- **Configuration attributes** (set in `__init__`, immutable after):
+  no trailing underscore. Examples: `alpha`, `forecaster`, `score_fn`.
+- **Fitted state attributes** (set in `calibrate()` or `update()`):
+  trailing underscore. Examples: `score_quantile_`, `is_calibrated_`,
+  `n_calibration_samples_`. These are method-specific.
+- `CalibrationResult` returned from `calibrate()` is a diagnostic snapshot
+  of fitted state at the time of the call. `predict()` reads from instance
+  attributes, never from the result object. Returned arrays are defensively
+  copied so subsequent `update()` calls don't mutate user-held results.
+
 ## Adding a new adapter (procedure)
 
 1. Read `adapters/callable.py` (simplest reference).

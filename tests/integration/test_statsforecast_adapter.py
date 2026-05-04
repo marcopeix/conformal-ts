@@ -18,6 +18,7 @@ from conformal_ts.capabilities import (  # noqa: E402
     SupportsQuantiles,
     SupportsRefit,
 )
+from conformal_ts.methods.split import SplitConformal  # noqa: E402
 
 # ---------------------------------------------------------------------------
 # Fixtures
@@ -348,3 +349,48 @@ class TestCapabilities:
     def test_not_supports_bootstrap(self) -> None:
         adapter, _ = _make_adapter()
         assert not isinstance(adapter, SupportsBootstrap)
+
+
+# ===========================================================================
+# SplitConformal calibration via cross_validate
+# ===========================================================================
+
+
+class TestSplitConformalCV:
+    """SplitConformal.calibrate(n_windows=...) dispatches to forecaster.cross_validate."""
+
+    def test_cv_path_matches_explicit_path(self) -> None:
+        """CV-based and predict_batch-based calibration produce the same quantile."""
+        adapter, df = _make_adapter(n_series=1, horizon=3, t_len=100)
+
+        # Fast path: delegate to cross_validate
+        method_cv = SplitConformal(adapter, alpha=0.1)
+        cal_cv = method_cv.calibrate(n_windows=10, step_size=1, refit=False)
+
+        # Slow path: replicate cross_validate manually via predict_batch
+        cv_preds, cv_truths = adapter.cross_validate(n_windows=10, step_size=1, refit=False)
+        # Build histories matching the CV cutoffs.
+        full = adapter._df_to_panel(df, "y")
+        T = full.shape[1]
+        cal_histories = [full[:, : T - 3 - (10 - 1 - w)] for w in range(10)]
+
+        method_explicit = SplitConformal(adapter, alpha=0.1)
+        cal_explicit = method_explicit.calibrate(cal_histories, cv_truths)
+
+        np.testing.assert_array_almost_equal(cal_cv.score_quantile, cal_explicit.score_quantile)
+        assert cal_cv.n_calibration_samples == cal_explicit.n_calibration_samples
+
+    def test_cv_calibration_then_predict(self) -> None:
+        """End-to-end: calibrate via CV, then predict produces a valid interval."""
+        adapter, df = _make_adapter(n_series=1, horizon=3, t_len=100)
+        method = SplitConformal(adapter, alpha=0.1)
+        method.calibrate(n_windows=10, step_size=1)
+
+        history = adapter._df_to_panel(df, "y")
+        result = method.predict(history)
+
+        assert result.point.shape == (1, 1, 3)
+        assert result.interval.shape == (1, 1, 3, 2)
+        # Interval should bracket the point forecast.
+        assert np.all(result.interval[..., 0] <= result.point)
+        assert np.all(result.point <= result.interval[..., 1])

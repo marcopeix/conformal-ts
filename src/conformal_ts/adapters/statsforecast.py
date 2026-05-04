@@ -243,8 +243,7 @@ class StatsForecastAdapter(
         -------
         Forecast, shape (n_series, 1, horizon)
         """
-        history = np.asarray(history, dtype=np.float64)
-        self._validate_history(history)
+        history = self._validate_history(history)
 
         history_df = self._panel_to_df(history, self._common_end)
         result_df = self._sf.forecast(h=self.horizon, df=history_df)
@@ -280,8 +279,7 @@ class StatsForecastAdapter(
         -------
         Forecast, shape (n_series, n_quantiles, horizon)
         """
-        history = np.asarray(history, dtype=np.float64)
-        self._validate_history(history)
+        history = self._validate_history(history)
         quantiles = np.asarray(quantiles, dtype=np.float64)
 
         levels, q_to_col = self._quantiles_to_levels(quantiles)
@@ -364,8 +362,7 @@ class StatsForecastAdapter(
         ----------
         history : Series, shape (n_series, T)
         """
-        history = np.asarray(history, dtype=np.float64)
-        self._validate_history(history)
+        history = self._validate_history(history)
 
         # Infer new end: extra steps = new data at the end of the panel.
         old_t_len = self._last_train_df.groupby(self.id_col)[self.time_col].count().iloc[0]
@@ -457,17 +454,3 @@ class StatsForecastAdapter(
             result[:, w_idx, :] = panel
 
         return result
-
-    # ------------------------------------------------------------------
-    # Internal helpers
-    # ------------------------------------------------------------------
-
-    def _validate_history(self, history: NDArray[np.floating]) -> None:
-        if history.ndim != 2:
-            raise ValueError(f"history must be 2-D (n_series, T), got shape {history.shape}")
-        if history.shape[0] != self.n_series:
-            raise ValueError(
-                f"history leading axis must be {self.n_series}, got {history.shape[0]}"
-            )
-        if np.isnan(history).any():
-            raise ValueError("history contains NaN values.")
