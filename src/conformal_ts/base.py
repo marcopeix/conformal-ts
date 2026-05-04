@@ -105,6 +105,39 @@ class ForecasterAdapter(ABC):
         out = [self.predict(h) for h in histories]  # each (n_series, 1, horizon)
         return np.concatenate(out, axis=1)
 
+    def _validate_history(self, history: Series) -> NDArray[np.floating]:
+        """
+        Validate and normalise a history array.
+
+        Casts to ``float64`` and checks that the array is 2-D with a leading
+        axis matching ``self.n_series`` and contains no NaN values. Concrete
+        adapters should call this at the top of every method that takes a
+        history.
+
+        Parameters
+        ----------
+        history : Series, shape (n_series, T)
+
+        Returns
+        -------
+        NDArray[np.floating], shape (n_series, T)
+            The same data cast to ``float64``.
+
+        Raises
+        ------
+        ValueError
+            If ``history`` is not 2-D, has the wrong leading axis, or
+            contains NaN.
+        """
+        arr = np.asarray(history, dtype=np.float64)
+        if arr.ndim != 2:
+            raise ValueError(f"history must be 2-D (n_series, T), got shape {arr.shape}")
+        if arr.shape[0] != self.n_series:
+            raise ValueError(f"history leading axis must be {self.n_series}, got {arr.shape[0]}")
+        if np.isnan(arr).any():
+            raise ValueError("history contains NaN values.")
+        return arr
+
 
 # -----------------------------------------------------------------------------
 # ScoreFunction
@@ -255,7 +288,7 @@ class ConformalMethod(ABC):
         self.forecaster = forecaster
         self.alpha = alpha
         self.score_fn = score if score is not None else self._default_score()
-        self._is_calibrated = False
+        self.is_calibrated_: bool = False
 
     def _check_capabilities(self, forecaster: ForecasterAdapter) -> None:
         for cap in self.REQUIRED_CAPABILITIES:
@@ -273,11 +306,28 @@ class ConformalMethod(ABC):
     @abstractmethod
     def calibrate(
         self,
-        histories: list[Series],
-        truths: Forecast,
+        histories: list[Series] | None = None,
+        truths: Forecast | None = None,
+        *,
+        n_windows: int | None = None,
+        step_size: int = 1,
+        refit: bool | int = False,
     ) -> CalibrationResult:
         """
         Fit the conformal correction on a calibration set.
+
+        Two calling conventions are supported:
+
+        * **Explicit calibration set** — pass ``histories`` and ``truths``.
+          The method loops over ``histories`` via ``forecaster.predict_batch``.
+          Works with any adapter.
+        * **Cross-validation** — pass ``n_windows`` (and optionally
+          ``step_size`` and ``refit``). The method delegates to
+          ``forecaster.cross_validate(...)`` to produce predictions and
+          truths in a single library-native call. Requires the adapter to
+          inherit :class:`SupportsCrossValidation`. For libraries with
+          a real CV implementation (StatsForecast, MLForecast, …), this
+          is dramatically faster than the explicit path.
 
         Implementations **must** call ``self.score_fn.fit(predictions, truths)``
         before ``self.score_fn.score(...)`` so that score functions which need
@@ -285,10 +335,18 @@ class ConformalMethod(ABC):
 
         Parameters
         ----------
-        histories : list of Series, each shape (n_series, T)
-            History available at each calibration timestep.
-        truths : Forecast, shape (n_series, len(histories), horizon)
-            Ground truth values for each calibration history and horizon.
+        histories : list of Series, optional
+            Each shape ``(n_series, T)``. Required if ``n_windows`` is None.
+        truths : Forecast, optional
+            Shape ``(n_series, len(histories), horizon)``. Required if
+            ``n_windows`` is None.
+        n_windows : int, optional
+            Number of cross-validation windows. If provided, dispatches to
+            ``forecaster.cross_validate``.
+        step_size : int
+            Step size between CV windows (only used with ``n_windows``).
+        refit : bool or int
+            Whether to refit between CV windows (only used with ``n_windows``).
 
         Returns
         -------

@@ -57,16 +57,10 @@ class CallableAdapter(ForecasterAdapter):
         Raises
         ------
         ValueError
-            If ``history`` is not 2-D or its leading axis does not match
-            ``self.n_series``, or if the callable returns an unexpected shape.
+            If ``history`` is not 2-D, has the wrong leading axis, contains
+            NaN, or if the callable returns an unexpected shape.
         """
-        history = np.asarray(history)
-        if history.ndim != 2:
-            raise ValueError(f"history must be 2-D (n_series, T), got shape {history.shape}")
-        if history.shape[0] != self.n_series:
-            raise ValueError(
-                f"history leading axis must be {self.n_series}, got {history.shape[0]}"
-            )
+        history = self._validate_history(history)
 
         raw = self._predict_fn(history)
         raw = np.asarray(raw, dtype=np.float64)
