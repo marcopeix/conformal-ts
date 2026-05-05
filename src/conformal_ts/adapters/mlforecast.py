@@ -293,7 +293,7 @@ class MLForecastAdapter(
         Reconstructs timestamps by stepping backward from *end_timestamp* at
         ``self.freq`` for *T* steps.
         """
-        n_s, t_len = panel.shape
+        t_len = panel.shape[1]
         timestamps = pd.date_range(end=end_timestamp, periods=t_len, freq=self.freq)
         rows: list[pd.DataFrame] = []
         for i, sid in enumerate(self._series_ids):
