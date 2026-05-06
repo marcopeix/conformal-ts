@@ -3,12 +3,18 @@
 Wraps a fitted ``mlforecast.MLForecast`` instance and exposes it through the
 conformal-ts adapter contract.
 
+Scope
+-----
+The adapter only exposes the operations conformal methods consume internally:
+panel-shaped point forecasts, refit, and cross-validation. Quantile forecasts,
+bootstrap ensembles, and other library-native uncertainty outputs are out of
+scope — conformal-ts derives intervals from point forecasts. Methods that
+need quantile or bootstrap inputs (e.g. CQR family, EnbPI) accept those
+arrays directly from the user; generate them with MLForecast and pass them
+to the method.
+
 Limitations (v0.1)
 ------------------
-- Quantile prediction is not supported (``SupportsQuantiles`` is not inherited).
-  conformal-ts produces its own intervals from point forecasts; quantile-based
-  methods (CQR family) require an adapter that exposes native quantile output.
-- Bootstrap prediction is not supported (``SupportsBootstrap`` is not inherited).
 - Static features, sample weights, and natively conformal predictions
   (``prediction_intervals=...``) are rejected at construction time.
 - Business-day frequencies (``'B'``, ``'BM'``, …) are not tested.
