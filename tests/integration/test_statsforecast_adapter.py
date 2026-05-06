@@ -222,43 +222,6 @@ class TestPredict:
 
 
 # ===========================================================================
-# predict_quantiles tests
-# ===========================================================================
-
-
-class TestPredictQuantiles:
-    """predict_quantiles() shape and validation."""
-
-    def test_output_shape(self) -> None:
-        adapter, df = _make_adapter(n_series=2, horizon=5, model_cls=AutoETS, season_length=1)
-        history = adapter._df_to_panel(df, "y")
-        quantiles = np.array([0.05, 0.1, 0.9, 0.95])
-        result = adapter.predict_quantiles(history, quantiles)
-        assert result.shape == (2, 4, 5)
-
-    def test_asymmetric_quantiles_raises(self) -> None:
-        adapter, df = _make_adapter(n_series=1, horizon=3, model_cls=AutoETS, season_length=1)
-        history = adapter._df_to_panel(df, "y")
-        with pytest.raises(ValueError, match="symmetric"):
-            adapter.predict_quantiles(history, np.array([0.1, 0.2, 0.9]))
-
-    def test_non_symmetric_pair_raises(self) -> None:
-        adapter, df = _make_adapter(n_series=1, horizon=3, model_cls=AutoETS, season_length=1)
-        history = adapter._df_to_panel(df, "y")
-        with pytest.raises(ValueError, match="not symmetric"):
-            adapter.predict_quantiles(history, np.array([0.1, 0.8]))
-
-    def test_single_pair(self) -> None:
-        adapter, df = _make_adapter(n_series=1, horizon=3, model_cls=AutoETS, season_length=1)
-        history = adapter._df_to_panel(df, "y")
-        quantiles = np.array([0.025, 0.975])
-        result = adapter.predict_quantiles(history, quantiles)
-        assert result.shape == (1, 2, 3)
-        # Lower quantile should be <= upper quantile
-        assert np.all(result[:, 0, :] <= result[:, 1, :])
-
-
-# ===========================================================================
 # refit tests
 # ===========================================================================
 
@@ -338,13 +301,13 @@ class TestCapabilities:
         adapter, _ = _make_adapter()
         assert isinstance(adapter, SupportsRefit)
 
-    def test_supports_quantiles(self) -> None:
-        adapter, _ = _make_adapter()
-        assert isinstance(adapter, SupportsQuantiles)
-
     def test_supports_cross_validation(self) -> None:
         adapter, _ = _make_adapter()
         assert isinstance(adapter, SupportsCrossValidation)
+
+    def test_not_supports_quantiles(self) -> None:
+        adapter, _ = _make_adapter()
+        assert not isinstance(adapter, SupportsQuantiles)
 
     def test_not_supports_bootstrap(self) -> None:
         adapter, _ = _make_adapter()

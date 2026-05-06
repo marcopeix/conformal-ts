@@ -4,10 +4,19 @@ Wraps a fitted ``statsforecast.StatsForecast`` instance and exposes it through
 the conformal-ts adapter contract.  This is the reference adapter for the
 Nixtla family of forecasting libraries.
 
+Scope
+-----
+The adapter only exposes the operations conformal methods consume internally:
+panel-shaped point forecasts, refit, and cross-validation. Quantile forecasts,
+bootstrap ensembles, and other library-native uncertainty outputs are out of
+scope — conformal-ts derives intervals from point forecasts. Methods that
+need quantile or bootstrap inputs (e.g. CQR family, EnbPI) accept those
+arrays directly from the user; generate them with StatsForecast and pass
+them to the method.
+
 Limitations (v0.1)
 ------------------
 - Covariates (static, historical exog, future exog) are not supported.
-- Bootstrap prediction is not supported (``SupportsBootstrap`` is not inherited).
 - Business-day frequencies (``'B'``, ``'BM'``, …) are not tested.
 - Only ``refit(history)`` is provided; no ``update_horizon`` or ``add_series``.
 - ``predict`` anchors forecasts at the adapter's known end timestamp. For
@@ -22,7 +31,7 @@ import numpy as np
 from numpy.typing import NDArray
 
 from ..base import Forecast, ForecasterAdapter, Series
-from ..capabilities import SupportsCrossValidation, SupportsQuantiles, SupportsRefit
+from ..capabilities import SupportsCrossValidation, SupportsRefit
 
 try:
     import pandas as pd  # type: ignore[import-untyped]
@@ -40,7 +49,6 @@ if TYPE_CHECKING:
 class StatsForecastAdapter(
     ForecasterAdapter,
     SupportsRefit,
-    SupportsQuantiles,
     SupportsCrossValidation,
 ):
     """
@@ -252,98 +260,6 @@ class StatsForecastAdapter(
         forecast_panel = self._df_to_panel(result_df, self.model_name)
         # (n_series, horizon) -> (n_series, 1, horizon)
         return forecast_panel[:, np.newaxis, :]
-
-    # ------------------------------------------------------------------
-    # SupportsQuantiles
-    # ------------------------------------------------------------------
-
-    def predict_quantiles(
-        self,
-        history: Series,
-        quantiles: NDArray[np.floating],
-    ) -> Forecast:
-        """
-        Predict requested quantiles via StatsForecast's level-based intervals.
-
-        Quantiles must be provided in symmetric pairs around 0.5 (e.g.
-        ``[0.05, 0.95]`` or ``[0.025, 0.1, 0.9, 0.975]``). Each pair maps to
-        a Nixtla ``level`` value.
-
-        Parameters
-        ----------
-        history : Series, shape (n_series, T)
-        quantiles : NDArray, shape (n_quantiles,)
-            Values in (0, 1), provided in symmetric pairs.
-
-        Returns
-        -------
-        Forecast, shape (n_series, n_quantiles, horizon)
-        """
-        history = self._validate_history(history)
-        quantiles = np.asarray(quantiles, dtype=np.float64)
-
-        levels, q_to_col = self._quantiles_to_levels(quantiles)
-
-        history_df = self._panel_to_df(history, self._common_end)
-        result_df = self._sf.forecast(h=self.horizon, df=history_df, level=levels)
-
-        # Validate that all expected columns exist
-        for col in q_to_col.values():
-            if col not in result_df.columns:
-                raise ValueError(
-                    f"StatsForecast did not return quantile column '{col}'. "
-                    f"The model '{self.model_name}' may not support quantile "
-                    "prediction. Use a model with native interval support "
-                    "(AutoARIMA, AutoETS, etc.)."
-                )
-
-        # Stack quantile forecasts in requested order: (n_series, n_quantiles, horizon)
-        slices = []
-        for q in quantiles:
-            col = q_to_col[float(q)]
-            panel = self._df_to_panel(result_df, col)  # (n_series, horizon)
-            slices.append(panel)
-        return np.stack(slices, axis=1)
-
-    def _quantiles_to_levels(
-        self, quantiles: NDArray[np.floating]
-    ) -> tuple[list[int], dict[float, str]]:
-        """Convert quantile values to Nixtla ``level`` ints.
-
-        Returns
-        -------
-        levels : list[int]
-            Unique level values for the ``forecast(level=...)`` call.
-        q_to_col : dict[float, str]
-            Map from each requested quantile to the StatsForecast column name.
-        """
-        qs = sorted(quantiles.tolist())
-        lower = [q for q in qs if q < 0.5]
-        upper = [q for q in qs if q > 0.5]
-
-        if len(lower) != len(upper):
-            raise ValueError(
-                "Quantiles must be provided in symmetric pairs around 0.5. "
-                f"Got {len(lower)} below 0.5 and {len(upper)} above 0.5. "
-                "Example: quantiles=[0.05, 0.95] or [0.025, 0.1, 0.9, 0.975]."
-            )
-
-        levels: list[int] = []
-        q_to_col: dict[float, str] = {}
-
-        for lo, hi in zip(lower, reversed(upper)):
-            if not np.isclose(lo + hi, 1.0):
-                raise ValueError(
-                    f"Quantile pair ({lo}, {hi}) is not symmetric around 0.5. "
-                    f"Expected {lo} + {hi} = 1.0, got {lo + hi:.6f}."
-                )
-            level = round((1.0 - 2.0 * lo) * 100)
-            levels.append(level)
-            q_to_col[lo] = f"{self.model_name}-lo-{level}"
-            q_to_col[hi] = f"{self.model_name}-hi-{level}"
-
-        levels = sorted(set(levels))
-        return levels, q_to_col
 
     # ------------------------------------------------------------------
     # SupportsRefit
