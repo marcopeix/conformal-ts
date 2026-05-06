@@ -3,5 +3,6 @@
 from __future__ import annotations
 
 from .absolute import AbsoluteResidual
+from .quantile import QuantileScore
 
-__all__ = ["AbsoluteResidual"]
+__all__ = ["AbsoluteResidual", "QuantileScore"]
