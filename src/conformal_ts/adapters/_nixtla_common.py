@@ -21,6 +21,66 @@ import pandas as pd  # type: ignore[import-untyped]
 from numpy.typing import NDArray
 
 
+def quantiles_to_levels(quantiles: NDArray[np.floating]) -> list[int]:
+    """Convert quantiles in (0, 1) to a sorted list of symmetric Nixtla level integers.
+
+    The Nixtla family (StatsForecast, NeuralForecast, MLForecast) all expose
+    intervals via integer ``level`` values: ``level=80`` →
+    ``<model>-lo-80`` / ``<model>-hi-80`` for the 10th and 90th percentiles.
+    The conformal-ts public API speaks in raw quantiles; this helper converts
+    a user-supplied quantile array to the level representation Nixtla
+    libraries actually consume.
+
+    Parameters
+    ----------
+    quantiles : NDArray, shape (n_quantiles,)
+        Values in ``(0, 1)``. Must come in symmetric pairs around 0.5
+        (e.g. ``[0.05, 0.95]``); ``q == 0.5`` is rejected because the
+        level API has no median column.
+
+    Returns
+    -------
+    list of int
+        Sorted unique levels.
+
+    Raises
+    ------
+    ValueError
+        If any quantile lies outside ``(0, 1)``, equals 0.5, or lacks its
+        symmetric counterpart.
+    """
+    arr = np.asarray(quantiles, dtype=np.float64)
+    if arr.ndim != 1:
+        raise ValueError(f"quantiles must be 1-D, got shape {arr.shape}.")
+    if arr.size == 0:
+        raise ValueError("quantiles must contain at least one value.")
+    if not np.all((arr > 0.0) & (arr < 1.0)):
+        raise ValueError(f"All quantiles must satisfy 0 < q < 1, got {arr.tolist()}.")
+    if np.any(np.isclose(arr, 0.5)):
+        raise ValueError(
+            "Quantile 0.5 (median) is not supported by the level-based API. "
+            "Pass strict (0, 0.5) ∪ (0.5, 1) values."
+        )
+    for q in arr:
+        mirror = 1.0 - float(q)
+        if not bool(np.any(np.isclose(arr, mirror))):
+            raise ValueError(
+                f"Quantile {float(q)} requires its symmetric pair {mirror} to "
+                f"also be present in quantiles. Got {arr.tolist()}."
+            )
+
+    levels: set[int] = set()
+    for q in arr:
+        q_lo = float(min(float(q), 1.0 - float(q)))
+        levels.add(int(round((1.0 - 2.0 * q_lo) * 100.0)))
+    return sorted(levels)
+
+
+def quantile_level(q: float) -> int:
+    """Integer level for one quantile (e.g. 0.05 → 90)."""
+    return int(round((1.0 - 2.0 * min(q, 1.0 - q)) * 100.0))
+
+
 def validate_pandas(df: Any) -> None:
     """Reject anything that isn't a ``pandas.DataFrame``.
 

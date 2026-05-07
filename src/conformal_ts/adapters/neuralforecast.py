@@ -5,15 +5,21 @@ through the conformal-ts adapter contract.
 
 Scope
 -----
-The adapter only exposes the operations conformal methods consume internally:
-panel-shaped point forecasts, refit, and cross-validation. Quantile forecasts,
-bootstrap ensembles, and other library-native uncertainty outputs are out of
-scope — conformal-ts derives intervals from point forecasts. NeuralForecast
-does support quantile-loss outputs (``MQLoss``, ``IQLoss``, …) and
-``nf.predict(quantiles=...)``, but exposing those via ``predict_quantiles``
-would be a thin passthrough that adds no value. Users wanting CQR with
-NeuralForecast should feed pre-computed quantile predictions through a
-future ``PrecomputedQuantileAdapter``.
+The adapter exposes panel-shaped point forecasts, quantile forecasts, refit,
+and cross-validation. Quantile output is gated at call time on whether the
+underlying model was fit with a probabilistic loss (any of the quantile-loss
+classes — ``QuantileLoss`` / ``MQLoss`` / ``IQLoss`` and their Huber variants
+— or any loss that exposes ``is_distribution_output = True`` such as
+``DistributionLoss``, ``PMM``, ``GMM``).
+
+The adapter always declares the :class:`SupportsQuantiles` and
+:class:`SupportsCrossValidationQuantiles` mixins. ``isinstance`` checks
+therefore return True regardless of the loss; the runtime gate is the
+:attr:`_supports_quantiles_runtime` flag, which is False for point-loss
+models. Calling ``predict_quantiles`` or ``cross_validate_quantiles`` on a
+point-loss adapter raises :class:`UnsupportedCapability` at call time. This
+"declare always, gate at runtime" pattern is necessary because the capability
+depends on a constructor argument (the loss), not the adapter class itself.
 
 Limitations (v0.1)
 ------------------
@@ -33,8 +39,13 @@ from typing import TYPE_CHECKING, Any
 import numpy as np
 from numpy.typing import NDArray
 
-from ..base import Forecast, ForecasterAdapter, Series
-from ..capabilities import SupportsCrossValidation, SupportsRefit
+from ..base import Forecast, ForecasterAdapter, Series, UnsupportedCapability
+from ..capabilities import (
+    SupportsCrossValidation,
+    SupportsCrossValidationQuantiles,
+    SupportsQuantiles,
+    SupportsRefit,
+)
 from . import _nixtla_common as _nx
 
 try:
@@ -60,10 +71,74 @@ def _model_alias(model: Any) -> str:
     return alias if alias is not None else type(model).__name__
 
 
+# NeuralForecast losses that produce quantile output deterministically.
+# Distribution losses (DistributionLoss / PMM / GMM / ISQF) advertise themselves
+# via the ``is_distribution_output`` attribute and are detected separately.
+QUANTILE_LOSS_CLASS_NAMES = frozenset(
+    {
+        "QuantileLoss",
+        "MQLoss",
+        "IQLoss",
+        "HuberQLoss",
+        "HuberMQLoss",
+        "HuberIQLoss",
+    }
+)
+
+
+def _supports_quantiles(loss: Any) -> bool:
+    """Detect whether a NeuralForecast loss can produce quantile output.
+
+    Two categories qualify:
+
+    * Distribution losses (``DistributionLoss``, ``PMM``, ``GMM``, ``ISQF``)
+      which set ``is_distribution_output = True`` and produce quantiles via
+      sampling.
+    * Direct quantile losses (``QuantileLoss``, ``MQLoss``, ``IQLoss``, and
+      their ``Huber*`` variants) which produce quantiles deterministically.
+    """
+    if getattr(loss, "is_distribution_output", False):
+        return True
+    return type(loss).__name__ in QUANTILE_LOSS_CLASS_NAMES
+
+
+def _resolve_quantile_column(model_name: str, columns: list[str], q: float) -> str:
+    """Find the NeuralForecast output column for a given quantile.
+
+    NeuralForecast's column naming convention varies across loss types and
+    versions. As of ``neuralforecast==3.1.x``:
+
+    * ``DistributionLoss`` produces ``<model>-lo-<level>`` / ``<model>-hi-<level>``
+      (no decimal suffix on the level).
+    * ``MQLoss`` and friends produce ``<model>-lo-<level>.0`` / ``<model>-hi-<level>.0``
+      (with a ``.0`` decimal suffix).
+
+    We try both conventions and return the first match. If neither column is
+    present, raise ``ValueError`` listing the candidates considered.
+    """
+    side = "lo" if q < 0.5 else "hi"
+    level = _nx.quantile_level(q)
+    candidates = [
+        f"{model_name}-{side}-{level}",
+        f"{model_name}-{side}-{level}.0",
+    ]
+    for candidate in candidates:
+        if candidate in columns:
+            return candidate
+    raise ValueError(
+        f"NeuralForecast did not return quantile column for q={q}. "
+        f"Tried {candidates}. Available columns: {columns}. For MQLoss, "
+        "the requested quantile must match a symmetric pair the loss was "
+        "trained with."
+    )
+
+
 class NeuralForecastAdapter(
     ForecasterAdapter,
     SupportsRefit,
     SupportsCrossValidation,
+    SupportsQuantiles,
+    SupportsCrossValidationQuantiles,
 ):
     """
     Adapter for a fitted :class:`neuralforecast.NeuralForecast` instance.
@@ -137,6 +212,14 @@ class NeuralForecastAdapter(
         self._last_train_df = train_df.copy()
         self._common_start: pd.Timestamp = common_start
         self._common_end: pd.Timestamp = common_end
+
+        # Runtime quantile capability is loss-driven, not class-driven. We
+        # always declare SupportsQuantiles / SupportsCrossValidationQuantiles
+        # at the class level (so isinstance is True and CQR's REQUIRED_CAPABILITIES
+        # check passes), then gate the actual methods at call time.
+        selected_model = next(m for m in nf.models if _model_alias(m) == model_name)
+        self._loss_class_name: str = type(selected_model.loss).__name__
+        self._supports_quantiles_runtime: bool = _supports_quantiles(selected_model.loss)
 
     # ------------------------------------------------------------------
     # Construction-time validation helpers
@@ -343,3 +426,145 @@ class NeuralForecastAdapter(
             n_series=self.n_series,
             horizon=self.horizon,
         )
+
+    # ------------------------------------------------------------------
+    # SupportsQuantiles (runtime-gated)
+    # ------------------------------------------------------------------
+
+    def _require_runtime_quantile_support(self) -> None:
+        if not self._supports_quantiles_runtime:
+            raise UnsupportedCapability(
+                f"NeuralForecast model '{self.model_name}' was fit with "
+                f"non-probabilistic loss '{self._loss_class_name}'. Use a "
+                "probabilistic loss: any quantile loss (QuantileLoss, MQLoss, "
+                "IQLoss, HuberQLoss, HuberMQLoss, HuberIQLoss) or any "
+                "DistributionLoss / PMM / GMM."
+            )
+
+    def predict_quantiles(
+        self,
+        history: Series,
+        quantiles: NDArray[np.floating],
+    ) -> Forecast:
+        """
+        Produce quantile forecasts via NeuralForecast's level-based API.
+
+        Parameters
+        ----------
+        history : Series, shape (n_series, T)
+        quantiles : NDArray, shape (n_quantiles,)
+            Values in ``(0, 1)``. Must come in symmetric pairs around 0.5;
+            ``q == 0.5`` is rejected. NeuralForecast's runtime behaviour for
+            ``MQLoss`` ignores arbitrary quantile requests in favour of the
+            quantiles the loss was trained with — this adapter therefore
+            uses ``level=`` (the underlying API both losses honour) and
+            requires symmetric inputs.
+
+        Returns
+        -------
+        Forecast, shape (n_series, n_quantiles, horizon)
+            Quantiles are on the middle axis, in the order requested.
+
+        Raises
+        ------
+        UnsupportedCapability
+            If the underlying model was fit with a non-probabilistic loss.
+        ValueError
+            If the symmetric-pair / range checks fail, or if the model did
+            not return a requested quantile column. For ``MQLoss``, the
+            requested quantiles must match a symmetric pair the loss was
+            trained with.
+        """
+        self._require_runtime_quantile_support()
+        history = self._validate_history(np.asarray(history, dtype=np.float64))
+        q_arr = np.asarray(quantiles, dtype=np.float64)
+        levels = _nx.quantiles_to_levels(q_arr)
+
+        history_df = self._panel_to_df(history, self._common_end)
+        result_df = self._nf.predict(df=history_df, level=levels)
+
+        columns = list(result_df.columns)
+        panels: list[NDArray[np.floating]] = []
+        for q in q_arr:
+            col = _resolve_quantile_column(self.model_name, columns, float(q))
+            panels.append(self._df_to_panel(result_df, col))  # (n_series, horizon)
+
+        return np.stack(panels, axis=1)  # (n_series, n_quantiles, horizon)
+
+    # ------------------------------------------------------------------
+    # SupportsCrossValidationQuantiles (runtime-gated)
+    # ------------------------------------------------------------------
+
+    def cross_validate_quantiles(
+        self,
+        n_windows: int,
+        step_size: int,
+        quantiles: NDArray[np.floating],
+        refit: bool | int = False,
+    ) -> tuple[Forecast, Forecast]:
+        """
+        Run rolling-origin cross-validation producing quantile forecasts.
+
+        Parameters
+        ----------
+        n_windows : int
+            Number of evaluation windows (>= 1).
+        step_size : int
+            Steps between successive windows (>= 1).
+        quantiles : NDArray, shape (n_quantiles,)
+            Values in ``(0, 1)``. Symmetric-pair / range rules of
+            :func:`_nixtla_common.quantiles_to_levels` apply.
+        refit : bool or int
+            Whether (or how often) to refit between windows.
+
+        Returns
+        -------
+        quantile_predictions : Forecast, shape (n_series, n_windows, horizon, n_quantiles)
+            Quantiles are on the **last axis**, in the order requested.
+        truths : Forecast, shape (n_series, n_windows, horizon)
+
+        Raises
+        ------
+        UnsupportedCapability
+            If the underlying model was fit with a non-probabilistic loss.
+        ValueError
+            If ``n_windows`` / ``step_size`` are invalid, the quantile
+            validation fails, or the model did not return a requested
+            quantile column.
+        RuntimeError
+            If the cross-validation output contains NaN.
+        """
+        self._require_runtime_quantile_support()
+        if n_windows < 1:
+            raise ValueError(f"n_windows must be >= 1, got {n_windows}")
+        if step_size < 1:
+            raise ValueError(f"step_size must be >= 1, got {step_size}")
+        q_arr = np.asarray(quantiles, dtype=np.float64)
+        levels = _nx.quantiles_to_levels(q_arr)
+
+        cv_df = self._nf.cross_validation(
+            df=self._last_train_df,
+            n_windows=n_windows,
+            step_size=step_size,
+            refit=refit,
+            level=levels,
+        )
+
+        truths = self._reshape_cv(cv_df, self.target_col)
+
+        columns = list(cv_df.columns)
+        panels: list[NDArray[np.floating]] = []
+        for q in q_arr:
+            col = _resolve_quantile_column(self.model_name, columns, float(q))
+            panels.append(self._reshape_cv(cv_df, col))
+
+        # (n_series, n_windows, horizon, n_quantiles)
+        quantile_predictions = np.stack(panels, axis=-1)
+
+        if np.isnan(quantile_predictions).any() or np.isnan(truths).any():
+            raise RuntimeError(
+                "cross_validation produced NaN values. This indicates an "
+                "internal error in the NeuralForecast cross-validation output."
+            )
+
+        return quantile_predictions, truths
