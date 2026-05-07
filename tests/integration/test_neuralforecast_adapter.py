@@ -1,0 +1,460 @@
+"""Integration tests for NeuralForecastAdapter.
+
+Note: NeuralForecast pulls in PyTorch and PyTorch Lightning, so the test
+suite is significantly heavier than the StatsForecast/MLForecast equivalents.
+Models are configured for cheap, deterministic CI runs (``max_steps`` small,
+``random_seed=0``, ``accelerator='cpu'``, progress bar / logger / summary
+disabled).
+"""
+
+from __future__ import annotations
+
+from typing import Any
+
+import numpy as np
+import pandas as pd
+import pytest
+
+nf_mod = pytest.importorskip("neuralforecast")
+NeuralForecast = nf_mod.NeuralForecast
+
+from neuralforecast.losses.pytorch import MAE  # noqa: E402
+from neuralforecast.models import MLP, MLPMultivariate  # noqa: E402
+from neuralforecast.utils import PredictionIntervals  # noqa: E402
+
+from conformal_ts.adapters.neuralforecast import NeuralForecastAdapter  # noqa: E402
+from conformal_ts.capabilities import (  # noqa: E402
+    SupportsBootstrap,
+    SupportsCrossValidation,
+    SupportsQuantiles,
+    SupportsRefit,
+)
+from conformal_ts.methods.split import SplitConformal  # noqa: E402
+
+# ---------------------------------------------------------------------------
+# Fixtures
+# ---------------------------------------------------------------------------
+
+# Shared kwargs that pin determinism + silence Lightning's noisy progress output.
+_TRAINER_QUIET: dict[str, Any] = {
+    "enable_progress_bar": False,
+    "enable_model_summary": False,
+    "logger": False,
+    "accelerator": "cpu",
+}
+
+
+def _make_df(
+    n_series: int = 1,
+    t_len: int = 100,
+    freq: str = "D",
+    start: str = "2020-01-01",
+    seed: int = 0,
+    id_col: str = "unique_id",
+    time_col: str = "ds",
+    target_col: str = "y",
+) -> pd.DataFrame:
+    """Create a synthetic long-format DataFrame."""
+    rng = np.random.default_rng(seed)
+    dates = pd.date_range(start, periods=t_len, freq=freq)
+    rows: list[pd.DataFrame] = []
+    for i in range(n_series):
+        sid = f"series_{i}"
+        rows.append(
+            pd.DataFrame(
+                {
+                    id_col: sid,
+                    time_col: dates,
+                    target_col: rng.standard_normal(t_len).cumsum(),
+                }
+            )
+        )
+    return pd.concat(rows, ignore_index=True)
+
+
+def _make_model(kind: str, *, horizon: int, n_series: int, **overrides: Any) -> Any:
+    """Build a univariate or multivariate MLP with deterministic, cheap settings."""
+    common: dict[str, Any] = {
+        "h": horizon,
+        "input_size": 12,
+        "max_steps": 10,
+        "loss": MAE(),
+        "random_seed": 0,
+        **_TRAINER_QUIET,
+    }
+    common.update(overrides)
+    if kind == "univariate":
+        return MLP(**common)
+    if kind == "multivariate":
+        return MLPMultivariate(n_series=n_series, **common)
+    raise ValueError(f"Unknown model kind: {kind}")
+
+
+def _make_adapter(
+    kind: str = "univariate",
+    n_series: int = 1,
+    t_len: int = 100,
+    horizon: int = 3,
+    freq: str = "D",
+    **model_overrides: Any,
+) -> tuple[NeuralForecastAdapter, pd.DataFrame]:
+    """Fit a NeuralForecast and return an adapter plus its training DataFrame."""
+    df = _make_df(n_series=n_series, t_len=t_len, freq=freq)
+    model = _make_model(kind, horizon=horizon, n_series=n_series, **model_overrides)
+    nf = NeuralForecast(models=[model], freq=freq)
+    nf.fit(df)
+    model_name = type(model).__name__ if model.alias is None else model.alias
+    adapter = NeuralForecastAdapter(nf=nf, train_df=df, freq=freq, model_name=model_name)
+    return adapter, df
+
+
+# Most parametrized tests run against both univariate and multivariate models.
+# MLPMultivariate jointly models all series and requires ``n_series >= 2``;
+# the parametrization picks ``n_series=2`` for it and ``n_series=1`` for MLP.
+@pytest.fixture(
+    params=[
+        pytest.param(("univariate", 1), id="univariate-n1"),
+        pytest.param(("univariate", 3), id="univariate-n3"),
+        pytest.param(("multivariate", 3), id="multivariate-n3"),
+    ]
+)
+def adapter_and_df(request: pytest.FixtureRequest) -> tuple[NeuralForecastAdapter, pd.DataFrame]:
+    kind, n_series = request.param
+    return _make_adapter(kind=kind, n_series=n_series, horizon=3, t_len=100)
+
+
+# ===========================================================================
+# Construction tests
+# ===========================================================================
+
+
+class TestConstruction:
+    """Successful construction and validation failures."""
+
+    def test_univariate_construction(self) -> None:
+        adapter, _ = _make_adapter(kind="univariate", n_series=1, horizon=3)
+        assert adapter.n_series == 1
+        assert adapter.horizon == 3
+        assert adapter.model_name == "MLP"
+
+    def test_multivariate_construction(self) -> None:
+        adapter, _ = _make_adapter(kind="multivariate", n_series=3, horizon=3)
+        assert adapter.n_series == 3
+        assert adapter.horizon == 3
+        assert adapter.model_name == "MLPMultivariate"
+
+    def test_alias_override(self) -> None:
+        df = _make_df(n_series=1, t_len=80)
+        model = _make_model("univariate", horizon=3, n_series=1, alias="custom_mlp")
+        nf = NeuralForecast(models=[model], freq="D")
+        nf.fit(df)
+        adapter = NeuralForecastAdapter(nf=nf, train_df=df, freq="D", model_name="custom_mlp")
+        assert adapter.model_name == "custom_mlp"
+
+    # --- validation failure tests ---
+
+    def test_not_fitted_raises(self) -> None:
+        df = _make_df()
+        nf = NeuralForecast(
+            models=[_make_model("univariate", horizon=3, n_series=1)],
+            freq="D",
+        )
+        with pytest.raises(ValueError, match="not fitted"):
+            NeuralForecastAdapter(nf=nf, train_df=df, freq="D", model_name="MLP")
+
+    def test_bad_model_name_raises(self) -> None:
+        df = _make_df()
+        nf = NeuralForecast(
+            models=[_make_model("univariate", horizon=3, n_series=1)],
+            freq="D",
+        )
+        nf.fit(df)
+        with pytest.raises(ValueError, match="model_name 'NoSuchModel'"):
+            NeuralForecastAdapter(nf=nf, train_df=df, freq="D", model_name="NoSuchModel")
+
+    def test_missing_columns_raises(self) -> None:
+        df = _make_df()
+        nf = NeuralForecast(
+            models=[_make_model("univariate", horizon=3, n_series=1)],
+            freq="D",
+        )
+        nf.fit(df)
+        bad_df = df.rename(columns={"y": "target"})
+        with pytest.raises(ValueError, match="missing required columns"):
+            NeuralForecastAdapter(nf=nf, train_df=bad_df, freq="D", model_name="MLP")
+
+    def test_invalid_freq_raises(self) -> None:
+        df = _make_df()
+        nf = NeuralForecast(
+            models=[_make_model("univariate", horizon=3, n_series=1)],
+            freq="D",
+        )
+        nf.fit(df)
+        with pytest.raises(ValueError, match="Invalid frequency"):
+            NeuralForecastAdapter(nf=nf, train_df=df, freq="BOGUS", model_name="MLP")
+
+    def test_non_contiguous_raises(self) -> None:
+        df = _make_df(t_len=100)
+        df = df.drop(index=50).reset_index(drop=True)
+        nf = NeuralForecast(
+            models=[_make_model("univariate", horizon=3, n_series=1)],
+            freq="D",
+        )
+        # NF rejects gaps internally; refit on a clean panel and pass the bad df
+        # to the adapter constructor instead.
+        clean = _make_df(t_len=100)
+        nf.fit(clean)
+        with pytest.raises(ValueError, match="Non-contiguous"):
+            NeuralForecastAdapter(nf=nf, train_df=df, freq="D", model_name="MLP")
+
+    def test_nan_target_raises(self) -> None:
+        clean_df = _make_df()
+        nf = NeuralForecast(
+            models=[_make_model("univariate", horizon=3, n_series=1)],
+            freq="D",
+        )
+        nf.fit(clean_df)
+        bad_df = clean_df.copy()
+        bad_df.loc[10, "y"] = np.nan
+        with pytest.raises(ValueError, match="NaN"):
+            NeuralForecastAdapter(nf=nf, train_df=bad_df, freq="D", model_name="MLP")
+
+    def test_insufficient_common_range_raises(self) -> None:
+        """Two series with barely overlapping ranges fail the 2*horizon check."""
+        dates1 = pd.date_range("2020-01-01", periods=50, freq="D")
+        dates2 = pd.date_range("2020-02-15", periods=50, freq="D")
+        rng = np.random.default_rng(0)
+        df = pd.concat(
+            [
+                pd.DataFrame(
+                    {
+                        "unique_id": "a",
+                        "ds": dates1,
+                        "y": rng.standard_normal(50).cumsum(),
+                    }
+                ),
+                pd.DataFrame(
+                    {
+                        "unique_id": "b",
+                        "ds": dates2,
+                        "y": rng.standard_normal(50).cumsum(),
+                    }
+                ),
+            ],
+            ignore_index=True,
+        )
+        # Fit on a clean panel to satisfy NF, then pass the bad panel to the adapter.
+        clean = _make_df(n_series=2, t_len=100)
+        nf = NeuralForecast(
+            models=[_make_model("univariate", horizon=3, n_series=2)],
+            freq="D",
+        )
+        nf.fit(clean)
+        with pytest.raises(ValueError, match="steps are needed"):
+            NeuralForecastAdapter(nf=nf, train_df=df, freq="D", model_name="MLP")
+
+    def test_not_neuralforecast_instance_raises(self) -> None:
+        df = _make_df()
+        with pytest.raises(ValueError, match="NeuralForecast instance"):
+            NeuralForecastAdapter(
+                nf="not_nf",  # type: ignore[arg-type]
+                train_df=df,
+                freq="D",
+                model_name="MLP",
+            )
+
+    def test_polars_df_rejected(self) -> None:
+        df = _make_df()
+        nf = NeuralForecast(
+            models=[_make_model("univariate", horizon=3, n_series=1)],
+            freq="D",
+        )
+        nf.fit(df)
+
+        class FakePolarsDF:
+            """Stand-in that isn't a pandas.DataFrame."""
+
+        with pytest.raises(ValueError, match="polars DataFrames are not supported"):
+            NeuralForecastAdapter(
+                nf=nf,
+                train_df=FakePolarsDF(),  # type: ignore[arg-type]
+                freq="D",
+                model_name="MLP",
+            )
+
+    def test_prediction_intervals_rejected(self) -> None:
+        """A fit with prediction_intervals must be rejected at construction."""
+        df = _make_df(n_series=1, t_len=100)
+        nf = NeuralForecast(
+            models=[_make_model("univariate", horizon=3, n_series=1)],
+            freq="D",
+        )
+        nf.fit(df, prediction_intervals=PredictionIntervals(n_windows=2))
+        # Confirm the test setup actually exercises the rejection path.
+        assert nf._cs_df is not None
+        with pytest.raises(ValueError, match="produces its own intervals"):
+            NeuralForecastAdapter(nf=nf, train_df=df, freq="D", model_name="MLP")
+
+    def test_horizon_mismatch_rejected(self) -> None:
+        """Adapter rejects an NF with mismatched horizons across models.
+
+        NeuralForecast itself asserts equal ``h`` at fit time, so the only way
+        to construct an instance carrying mismatched horizons is to mutate a
+        model's ``h`` attribute after fit. The adapter is the second line of
+        defence; this test exercises that line directly.
+        """
+        df = _make_df(n_series=1, t_len=120)
+        nf = NeuralForecast(
+            models=[
+                _make_model("univariate", horizon=10, n_series=1, alias="m10"),
+                _make_model("univariate", horizon=10, n_series=1, alias="m12"),
+            ],
+            freq="D",
+        )
+        nf.fit(df)
+        nf.models[1].h = 12  # induce a mismatch
+        with pytest.raises(ValueError, match="must share the same horizon"):
+            NeuralForecastAdapter(nf=nf, train_df=df, freq="D", model_name="m10")
+
+    def test_future_exog_rejected(self) -> None:
+        df = _make_df(n_series=1, t_len=100)
+        rng = np.random.default_rng(0)
+        df = df.assign(feat_x=rng.standard_normal(len(df)))
+        model = _make_model("univariate", horizon=3, n_series=1, futr_exog_list=["feat_x"])
+        nf = NeuralForecast(models=[model], freq="D")
+        nf.fit(df)
+        with pytest.raises(ValueError, match="future exogenous"):
+            NeuralForecastAdapter(nf=nf, train_df=df, freq="D", model_name="MLP")
+
+
+# ===========================================================================
+# predict tests
+# ===========================================================================
+
+
+class TestPredict:
+    """predict() shape, determinism, and anchor semantics."""
+
+    def test_output_shape(self, adapter_and_df: tuple[NeuralForecastAdapter, pd.DataFrame]) -> None:
+        adapter, df = adapter_and_df
+        history = adapter._df_to_panel(df, "y")
+        result = adapter.predict(history)
+        assert result.shape == (adapter.n_series, 1, adapter.horizon)
+
+    @pytest.mark.parametrize("horizon", [1, 6])
+    def test_horizon_extraction(self, horizon: int) -> None:
+        """Adapter horizon equals the model's h, regardless of value."""
+        adapter, _ = _make_adapter(kind="univariate", n_series=1, horizon=horizon, t_len=100)
+        assert adapter.horizon == horizon
+
+    def test_determinism(self, adapter_and_df: tuple[NeuralForecastAdapter, pd.DataFrame]) -> None:
+        adapter, df = adapter_and_df
+        history = adapter._df_to_panel(df, "y")
+        r1 = adapter.predict(history)
+        r2 = adapter.predict(history)
+        np.testing.assert_array_equal(r1, r2)
+
+
+# ===========================================================================
+# refit tests
+# ===========================================================================
+
+
+class TestRefit:
+    """refit() updates the model and anchoring."""
+
+    def test_refit_with_longer_panel_shifts_end(
+        self, adapter_and_df: tuple[NeuralForecastAdapter, pd.DataFrame]
+    ) -> None:
+        adapter, _ = adapter_and_df
+        old_end = adapter._common_end
+
+        new_df = _make_df(n_series=adapter.n_series, t_len=120, seed=1)
+        new_panel = adapter._df_to_panel(new_df, "y")
+
+        adapter.refit(new_panel)
+
+        assert adapter._common_end == old_end + pd.Timedelta(days=20)
+        result = adapter.predict(new_panel)
+        assert result.shape == (adapter.n_series, 1, adapter.horizon)
+
+    def test_refit_with_different_series_raises(self) -> None:
+        adapter, _ = _make_adapter(kind="univariate", n_series=2, horizon=3)
+        bad_panel = np.random.default_rng(0).standard_normal((3, 100))
+        with pytest.raises(ValueError, match="leading axis"):
+            adapter.refit(bad_panel)
+
+
+# ===========================================================================
+# cross_validate tests
+# ===========================================================================
+
+
+class TestCrossValidate:
+    """cross_validate() shapes and validation."""
+
+    def test_output_shape(self, adapter_and_df: tuple[NeuralForecastAdapter, pd.DataFrame]) -> None:
+        adapter, _ = adapter_and_df
+        n_windows = 3
+        step_size = 1
+        preds, truths = adapter.cross_validate(n_windows=n_windows, step_size=step_size)
+        assert preds.shape == (adapter.n_series, n_windows, adapter.horizon)
+        assert truths.shape == (adapter.n_series, n_windows, adapter.horizon)
+
+    def test_invalid_n_windows_raises(self) -> None:
+        adapter, _ = _make_adapter()
+        with pytest.raises(ValueError, match="n_windows"):
+            adapter.cross_validate(n_windows=0, step_size=1)
+
+    def test_invalid_step_size_raises(self) -> None:
+        adapter, _ = _make_adapter()
+        with pytest.raises(ValueError, match="step_size"):
+            adapter.cross_validate(n_windows=2, step_size=0)
+
+
+# ===========================================================================
+# Capability declarations
+# ===========================================================================
+
+
+class TestCapabilities:
+    """isinstance checks for capability mixins."""
+
+    def test_supports_refit(self) -> None:
+        adapter, _ = _make_adapter()
+        assert isinstance(adapter, SupportsRefit)
+
+    def test_supports_cross_validation(self) -> None:
+        adapter, _ = _make_adapter()
+        assert isinstance(adapter, SupportsCrossValidation)
+
+    def test_not_supports_quantiles(self) -> None:
+        adapter, _ = _make_adapter()
+        assert not isinstance(adapter, SupportsQuantiles)
+
+    def test_not_supports_bootstrap(self) -> None:
+        adapter, _ = _make_adapter()
+        assert not isinstance(adapter, SupportsBootstrap)
+
+
+# ===========================================================================
+# SplitConformal calibration via cross_validate
+# ===========================================================================
+
+
+class TestSplitConformalCV:
+    """SplitConformal.calibrate(n_windows=...) dispatches to forecaster.cross_validate."""
+
+    def test_cv_calibration_then_predict(self) -> None:
+        """End-to-end: calibrate via CV, then predict produces a valid interval."""
+        adapter, df = _make_adapter(kind="univariate", n_series=1, horizon=3, t_len=100)
+        method = SplitConformal(adapter, alpha=0.1)
+        method.calibrate(n_windows=10, step_size=1)
+
+        history = adapter._df_to_panel(df, "y")
+        result = method.predict(history)
+
+        assert result.point.shape == (1, 1, 3)
+        assert result.interval.shape == (1, 1, 3, 2)
+        assert np.all(result.interval[..., 0] <= result.point)
+        assert np.all(result.point <= result.interval[..., 1])

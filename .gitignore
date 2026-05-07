@@ -26,6 +26,9 @@ htmlcov/
 coverage.xml
 .hypothesis/
 
+# pt_lightning
+lightning_logs/
+
 # Linting & type checking
 .ruff_cache/
 .mypy_cache/
