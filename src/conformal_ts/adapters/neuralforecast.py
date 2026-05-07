@@ -1,26 +1,29 @@
-"""MLForecast adapter for conformal-ts.
+"""NeuralForecast adapter for conformal-ts.
 
-Wraps a fitted ``mlforecast.MLForecast`` instance and exposes it through the
-conformal-ts adapter contract.
+Wraps a fitted ``neuralforecast.NeuralForecast`` instance and exposes it
+through the conformal-ts adapter contract.
 
 Scope
 -----
 The adapter only exposes the operations conformal methods consume internally:
 panel-shaped point forecasts, refit, and cross-validation. Quantile forecasts,
 bootstrap ensembles, and other library-native uncertainty outputs are out of
-scope — conformal-ts derives intervals from point forecasts. Methods that
-need quantile or bootstrap inputs (e.g. CQR family, EnbPI) accept those
-arrays directly from the user; generate them with MLForecast and pass them
-to the method.
+scope — conformal-ts derives intervals from point forecasts. NeuralForecast
+does support quantile-loss outputs (``MQLoss``, ``IQLoss``, …) and
+``nf.predict(quantiles=...)``, but exposing those via ``predict_quantiles``
+would be a thin passthrough that adds no value. Users wanting CQR with
+NeuralForecast should feed pre-computed quantile predictions through a
+future ``PrecomputedQuantileAdapter``.
 
 Limitations (v0.1)
 ------------------
-- Static features, sample weights, and natively conformal predictions
-  (``prediction_intervals=...``) are rejected at construction time.
-- Business-day frequencies (``'B'``, ``'BM'``, …) are not tested.
-- Only ``refit(history)`` is provided; no incremental update.
-- ``predict`` anchors forecasts at the adapter's known end timestamp. For
-  forecasting from arbitrary recent data, call ``refit`` with a newer panel.
+- Static, historical, and future exogenous features are rejected at
+  construction.
+- Polars DataFrames are not supported. Convert with ``df.to_pandas()`` first.
+- All models in the underlying ``NeuralForecast`` must share the same horizon.
+- ``refit`` retrains the neural network on the new history. This is
+  significantly slower than the StatsForecast / MLForecast equivalents; for
+  online-style usage, batch refits.
 """
 
 from __future__ import annotations
@@ -36,10 +39,10 @@ from . import _nixtla_common as _nx
 
 try:
     import pandas as pd  # type: ignore[import-untyped]
-    from mlforecast import MLForecast  # type: ignore[import-untyped]
+    from neuralforecast import NeuralForecast  # type: ignore[import-untyped]
 except ImportError as _err:
     raise ImportError(
-        "MLForecastAdapter requires the 'mlforecast' package. "
+        "NeuralForecastAdapter requires the 'neuralforecast' package. "
         "Install it with: pip install conformal-ts[nixtla]"
     ) from _err
 
@@ -47,32 +50,47 @@ if TYPE_CHECKING:
     pass
 
 
-class MLForecastAdapter(
+def _model_alias(model: Any) -> str:
+    """Resolve a NeuralForecast model's effective alias.
+
+    NF models carry an ``alias`` attribute that defaults to ``None``; in that
+    case the column name in predict output falls back to the class name.
+    """
+    alias = getattr(model, "alias", None)
+    return alias if alias is not None else type(model).__name__
+
+
+class NeuralForecastAdapter(
     ForecasterAdapter,
     SupportsRefit,
     SupportsCrossValidation,
 ):
     """
-    Adapter for a fitted :class:`mlforecast.MLForecast` instance.
+    Adapter for a fitted :class:`neuralforecast.NeuralForecast` instance.
 
-    The adapter wraps **point** forecasters only. Any MLForecast configuration
-    that produces intervals natively (``prediction_intervals``) is rejected at
-    construction; conformal-ts produces its own intervals from point forecasts.
+    The adapter wraps **point** forecasters only. Any NeuralForecast
+    configuration that produces intervals natively (``prediction_intervals``)
+    is rejected at construction; conformal-ts produces its own intervals
+    from point forecasts.
+
+    The horizon is read from the underlying models' ``h`` attribute. All
+    models in ``nf.models`` must share the same horizon.
 
     Parameters
     ----------
-    mlf : MLForecast
-        An already-fitted MLForecast instance with point models only.
+    nf : NeuralForecast
+        An already-fitted NeuralForecast instance with point models only.
     train_df : pd.DataFrame
-        The long-format pandas DataFrame used to fit ``mlf``. Polars DataFrames
+        The long-format pandas DataFrame used to fit ``nf``. Polars DataFrames
         are not supported in v0.1.
-    horizon : int
-        Forecast horizon in time steps.
     freq : str
         Pandas frequency string (e.g. ``'D'``, ``'h'``, ``'MS'``, ``'W'``).
+        Must match the frequency the NeuralForecast instance was constructed
+        with.
     model_name : str
-        Which model column to read from MLForecast output. Must be an alias
-        present in ``mlf.models_``.
+        Which model column to read from NeuralForecast output. Must be the
+        alias of a model in ``nf.models`` (or its class name if no alias was
+        set explicitly).
     id_col : str
         Column identifying individual series (default ``'unique_id'``).
     time_col : str
@@ -83,9 +101,8 @@ class MLForecastAdapter(
 
     def __init__(
         self,
-        mlf: MLForecast,
+        nf: NeuralForecast,
         train_df: pd.DataFrame,
-        horizon: int,
         freq: str,
         model_name: str,
         id_col: str = "unique_id",
@@ -100,11 +117,11 @@ class MLForecastAdapter(
 
         # --- validation ---
         _nx.validate_pandas(train_df)
-        self._validate_fitted(mlf)
-        self._validate_model_name(mlf, model_name)
-        self._validate_no_prediction_intervals(mlf)
-        self._validate_no_static_features(mlf)
-        self._validate_no_weight_col(mlf)
+        self._validate_fitted(nf)
+        self._validate_model_name(nf, model_name)
+        self._validate_no_prediction_intervals(nf)
+        horizon = self._validate_horizon_consistency(nf)
+        self._validate_no_exogenous(nf, model_name)
         _nx.validate_columns(train_df, id_col=id_col, time_col=time_col, target_col=target_col)
         self._offset = _nx.validate_freq(freq)
         _nx.validate_contiguity(train_df, id_col=id_col, time_col=time_col, freq=freq)
@@ -112,12 +129,11 @@ class MLForecastAdapter(
         self._series_ids, common_start, common_end = _nx.compute_panel_bounds(
             train_df, horizon, id_col=id_col, time_col=time_col, freq=freq
         )
-        self._validate_horizon_compatibility(mlf, horizon)
 
         n_series = len(self._series_ids)
         super().__init__(horizon=horizon, n_series=n_series)
 
-        self._mlf = mlf
+        self._nf = nf
         self._last_train_df = train_df.copy()
         self._common_start: pd.Timestamp = common_start
         self._common_end: pd.Timestamp = common_end
@@ -126,80 +142,52 @@ class MLForecastAdapter(
     # Construction-time validation helpers
     # ------------------------------------------------------------------
 
-    def _validate_fitted(self, mlf: Any) -> None:
-        if not isinstance(mlf, MLForecast):
-            raise ValueError(f"Expected an MLForecast instance, got {type(mlf).__name__}.")
-        if not (hasattr(mlf, "models_") and bool(mlf.models_)):
-            raise ValueError("MLForecast instance is not fitted. Call mlf.fit(df) first.")
+    def _validate_fitted(self, nf: Any) -> None:
+        if not isinstance(nf, NeuralForecast):
+            raise ValueError(f"Expected a NeuralForecast instance, got {type(nf).__name__}.")
+        if not getattr(nf, "_fitted", False):
+            raise ValueError("NeuralForecast instance is not fitted. Call nf.fit(df) first.")
 
-    def _validate_model_name(self, mlf: MLForecast, model_name: str) -> None:
-        if model_name not in mlf.models_:
+    def _validate_model_name(self, nf: NeuralForecast, model_name: str) -> None:
+        aliases = [_model_alias(m) for m in nf.models]
+        if model_name not in aliases:
             raise ValueError(
-                f"model_name '{model_name}' not found among fitted models. "
-                f"Available: {list(mlf.models_.keys())}"
+                f"model_name '{model_name}' not found among fitted models. Available: {aliases}"
             )
 
-    def _validate_no_prediction_intervals(self, mlf: MLForecast) -> None:
-        # MLForecast.fit assigns ``_cs_df = None`` and only writes a DataFrame to
-        # it when prediction_intervals is passed. Use getattr so the check
-        # survives older mlforecast versions where the attribute may be absent.
-        if getattr(mlf, "_cs_df", None) is not None:
+    def _validate_no_prediction_intervals(self, nf: NeuralForecast) -> None:
+        # NeuralForecast.fit assigns ``_cs_df`` to a calibration DataFrame only
+        # when prediction_intervals is passed; otherwise it stays None (or
+        # absent on instances that have never gone through fit).
+        if getattr(nf, "_cs_df", None) is not None:
             raise ValueError(
-                "MLForecast was fit with prediction_intervals. conformal-ts "
+                "NeuralForecast was fit with prediction_intervals. conformal-ts "
                 "produces its own intervals from point forecasts — refit with "
-                "mlf.fit(df) without the prediction_intervals argument."
+                "nf.fit(df) without the prediction_intervals argument."
             )
 
-    def _validate_no_static_features(self, mlf: MLForecast) -> None:
-        # Different mlforecast versions stash this either on ``mlf`` directly
-        # or on the inner ``mlf.ts`` core. Check both.
-        static = getattr(mlf, "static_features_", None)
-        if not static:
-            ts = getattr(mlf, "ts", None)
-            static = getattr(ts, "static_features", None) if ts is not None else None
-        if static:
+    def _validate_horizon_consistency(self, nf: NeuralForecast) -> int:
+        horizons = {_model_alias(m): int(m.h) for m in nf.models}
+        unique_h = set(horizons.values())
+        if len(unique_h) != 1:
             raise ValueError(
-                "Static features are not supported in conformal-ts v0.1. "
-                "Refit MLForecast without static_features."
+                f"All models in NeuralForecast must share the same horizon h. Got: {horizons}."
             )
+        return int(nf.models[0].h)
 
-    def _validate_no_weight_col(self, mlf: MLForecast) -> None:
-        weight = getattr(mlf, "weight_col", None)
-        if weight is None:
-            ts = getattr(mlf, "ts", None)
-            weight = getattr(ts, "weight_col", None) if ts is not None else None
-        if weight is not None:
-            raise ValueError("Sample weights are not supported in conformal-ts v0.1.")
-
-    def _validate_horizon_compatibility(self, mlf: MLForecast, horizon: int) -> None:
-        max_horizon = getattr(mlf, "max_horizon", None)
-        if max_horizon is None:
-            ts = getattr(mlf, "ts", None)
-            max_horizon = getattr(ts, "max_horizon", None) if ts is not None else None
-        if max_horizon is not None and max_horizon < horizon:
-            raise ValueError(
-                f"MLForecast was fit with max_horizon={max_horizon}, cannot "
-                f"forecast {horizon} steps. Refit with max_horizon >= {horizon} "
-                "or with the default recursive strategy."
-            )
-
-        horizons_ = getattr(mlf, "horizons_", None)
-        if horizons_ is None:
-            ts = getattr(mlf, "ts", None)
-            internal = getattr(ts, "_horizons", None) if ts is not None else None
-            # Internal storage in mlforecast is 0-indexed; the public contract
-            # documented in fit() is 1-indexed. Convert before comparing.
-            if internal is not None:
-                horizons_ = [int(h) + 1 for h in internal]
-        if horizons_ is not None:
-            required = set(range(1, horizon + 1))
-            present = set(int(h) for h in horizons_)
-            missing = sorted(required - present)
-            if missing:
+    def _validate_no_exogenous(self, nf: NeuralForecast, model_name: str) -> None:
+        target = next(m for m in nf.models if _model_alias(m) == model_name)
+        categories = {
+            "future exogenous": "futr_exog_list",
+            "historical exogenous": "hist_exog_list",
+            "static": "stat_exog_list",
+        }
+        for label, attr in categories.items():
+            features = getattr(target, attr, None)
+            if features:
                 raise ValueError(
-                    f"MLForecast was fit with horizons={sorted(present)}, missing "
-                    f"required steps {missing} for horizon={horizon}. Refit with "
-                    f"horizons covering 1..{horizon} or with the default recursive strategy."
+                    f"Model '{model_name}' uses {label} features ({list(features)}). "
+                    "Exogenous and static features are not supported in conformal-ts v0.1."
                 )
 
     # ------------------------------------------------------------------
@@ -249,7 +237,7 @@ class MLForecastAdapter(
         history = self._validate_history(np.asarray(history, dtype=np.float64))
 
         history_df = self._panel_to_df(history, self._common_end)
-        result_df = self._mlf.predict(h=self.horizon, new_df=history_df)
+        result_df = self._nf.predict(df=history_df)
 
         forecast_panel = self._df_to_panel(result_df, self.model_name)
         return forecast_panel[:, np.newaxis, :]
@@ -260,11 +248,15 @@ class MLForecastAdapter(
 
     def refit(self, history: Series) -> None:
         """
-        Refit the underlying MLForecast model on a new history panel.
+        Refit the underlying NeuralForecast model on a new history panel.
 
         The set of series must be identical to the original training data.
         If the new panel is longer than the previous one, the end timestamp
         shifts forward proportionally.
+
+        Note that NeuralForecast's ``fit`` retrains the neural networks from
+        scratch and may take significantly longer than the StatsForecast or
+        MLForecast equivalents. For online-style usage, batch the refits.
 
         Parameters
         ----------
@@ -283,7 +275,7 @@ class MLForecastAdapter(
                 f"Expected {list(self._series_ids)}, got {list(new_ids)}."
             )
 
-        self._mlf.fit(history_df)
+        self._nf.fit(history_df)
         self._last_train_df = history_df.copy()
 
         starts = history_df.groupby(self.id_col)[self.time_col].min()
@@ -323,17 +315,12 @@ class MLForecastAdapter(
         if step_size < 1:
             raise ValueError(f"step_size must be >= 1, got {step_size}")
 
-        cv_df = self._mlf.cross_validation(
+        cv_df = self._nf.cross_validation(
             df=self._last_train_df,
-            h=self.horizon,
             n_windows=n_windows,
             step_size=step_size,
             refit=refit,
         )
-        # MLForecast.cross_validation drops ``models_`` on the underlying
-        # instance and instructs callers to refit. Restore the fitted state on
-        # the stored training data so subsequent ``predict`` calls work.
-        self._mlf.fit(self._last_train_df)
 
         predictions = self._reshape_cv(cv_df, self.model_name)
         truths = self._reshape_cv(cv_df, self.target_col)
@@ -341,7 +328,7 @@ class MLForecastAdapter(
         if np.isnan(predictions).any() or np.isnan(truths).any():
             raise RuntimeError(
                 "cross_validation produced NaN values. This indicates an "
-                "internal error in the MLForecast cross-validation output."
+                "internal error in the NeuralForecast cross-validation output."
             )
 
         return predictions, truths
