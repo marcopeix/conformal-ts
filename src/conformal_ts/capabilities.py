@@ -115,3 +115,47 @@ class SupportsCrossValidation(ABC):
         truths : Forecast, shape (n_series, n_windows, horizon)
         """
         ...
+
+
+class SupportsCrossValidationQuantiles(ABC):
+    """Adapter can produce quantile forecasts via cross-validation.
+
+    This is the fast calibration path for CQR (and any future quantile-based
+    conformal method). Adapters with this capability avoid the per-sample loop
+    of ``predict_quantiles``, instead leveraging the underlying library's
+    cross-validation API to produce all calibration samples in a single call.
+    """
+
+    @abstractmethod
+    def cross_validate_quantiles(
+        self,
+        n_windows: int,
+        step_size: int,
+        quantiles: NDArray[np.floating],
+        refit: bool | int = False,
+    ) -> tuple[Forecast, Forecast]:
+        """
+        Run rolling-origin cross-validation producing quantile forecasts.
+
+        Parameters
+        ----------
+        n_windows : int
+            Number of evaluation windows.
+        step_size : int
+            Number of time steps between successive windows.
+        quantiles : NDArray, shape (n_quantiles,)
+            Values in (0, 1).
+        refit : bool or int, default False
+            Same semantics as :meth:`SupportsCrossValidation.cross_validate`.
+
+        Returns
+        -------
+        quantile_predictions : Forecast, shape (n_series, n_windows, horizon, n_quantiles)
+            Quantiles are on the **last axis**, matching :class:`QuantileScore`'s
+            expected input. This differs from :meth:`SupportsQuantiles.predict_quantiles`,
+            where quantiles are on axis 1 (because ``predict_quantiles`` produces a
+            single sample per call). The intentional axis difference avoids an
+            extra transpose in the CQR fast path.
+        truths : Forecast, shape (n_series, n_windows, horizon)
+        """
+        ...

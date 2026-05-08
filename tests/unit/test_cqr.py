@@ -17,7 +17,10 @@ from conformal_ts.base import (
     Series,
     UnsupportedCapability,
 )
-from conformal_ts.capabilities import SupportsQuantiles
+from conformal_ts.capabilities import (
+    SupportsCrossValidationQuantiles,
+    SupportsQuantiles,
+)
 from conformal_ts.methods.cqr import ConformalizedQuantileRegression
 from conformal_ts.methods.split import SplitConformal
 
@@ -69,6 +72,57 @@ class QuantileCallableAdapter(ForecasterAdapter, SupportsQuantiles):
                 f"({self.n_series}, {n_q}, {self.horizon}), got {raw.shape}"
             )
         return raw
+
+
+class QuantileCVCallableAdapter(QuantileCallableAdapter, SupportsCrossValidationQuantiles):
+    """Variant that also implements SupportsCrossValidationQuantiles.
+
+    The CV implementation simply replays a pre-baked list of calibration
+    histories through ``predict_quantiles_fn`` and zips the results with a
+    pre-baked truths panel. This lets the CV path of CQR be tested against
+    the loop path with identical inputs.
+    """
+
+    def __init__(
+        self,
+        predict_fn: Callable[[NDArray[np.floating]], NDArray[np.floating]],
+        predict_quantiles_fn: Callable[
+            [NDArray[np.floating], NDArray[np.floating]], NDArray[np.floating]
+        ],
+        horizon: int,
+        n_series: int,
+        cv_histories: list[NDArray[np.floating]],
+        cv_truths: NDArray[np.floating],
+    ) -> None:
+        super().__init__(
+            predict_fn=predict_fn,
+            predict_quantiles_fn=predict_quantiles_fn,
+            horizon=horizon,
+            n_series=n_series,
+        )
+        self._cv_histories = cv_histories
+        self._cv_truths = np.asarray(cv_truths, dtype=np.float64)
+
+    def cross_validate_quantiles(
+        self,
+        n_windows: int,
+        step_size: int,
+        quantiles: NDArray[np.floating],
+        refit: bool | int = False,
+    ) -> tuple[Forecast, Forecast]:
+        if n_windows > len(self._cv_histories):
+            raise ValueError(
+                f"n_windows={n_windows} exceeds bound histories ({len(self._cv_histories)})"
+            )
+        # Each call: (n_series, n_q, horizon).
+        raw = np.stack(
+            [self.predict_quantiles(h, quantiles) for h in self._cv_histories[:n_windows]],
+            axis=0,
+        )  # (n_windows, n_series, n_q, horizon)
+        # -> (n_series, n_windows, horizon, n_q): quantiles on the LAST axis.
+        preds = np.transpose(raw, (1, 0, 3, 2))
+        truths = self._cv_truths[:, :n_windows, :]
+        return preds, truths
 
 
 # ---------------------------------------------------------------------------
@@ -428,16 +482,17 @@ class TestCalibrationErrors:
         with pytest.raises(CalibrationError, match="calibration samples"):
             method.calibrate(histories, truths)
 
-    def test_n_windows_raises_not_implemented(self) -> None:
+    def test_n_windows_on_non_cv_adapter_raises_value_error(self) -> None:
+        """Adapter has SupportsQuantiles but not SupportsCrossValidationQuantiles."""
         adapter = _make_const_quantile_adapter(1, 1)
         method = ConformalizedQuantileRegression(adapter, alpha=0.1)
-        with pytest.raises(NotImplementedError, match="cross-validation"):
+        with pytest.raises(ValueError, match="SupportsCrossValidationQuantiles"):
             method.calibrate(n_windows=10)
 
     def test_missing_inputs_raises_value_error(self) -> None:
         adapter = _make_const_quantile_adapter(1, 1)
         method = ConformalizedQuantileRegression(adapter, alpha=0.1)
-        with pytest.raises(ValueError, match="histories"):
+        with pytest.raises(ValueError, match="histories, truths"):
             method.calibrate()
 
 
@@ -595,3 +650,217 @@ class TestFittedState:
         assert cal.diagnostics["path"] == "loop"
         assert cal.diagnostics["symmetric"] is True
         assert cal.diagnostics["quantiles_used"] == [0.05, 0.95]
+
+
+# ---------------------------------------------------------------------------
+# CV fast path
+# ---------------------------------------------------------------------------
+
+
+def _make_cv_adapter(
+    n_series: int,
+    horizon: int,
+    cv_histories: list[np.ndarray],
+    cv_truths: np.ndarray,
+) -> QuantileCVCallableAdapter:
+    """CV-capable adapter using the same const quantile shape as the loop tests."""
+
+    def predict_fn(history: np.ndarray) -> np.ndarray:
+        return np.repeat(history[:, -1:], horizon, axis=1)
+
+    def predict_quantiles_fn(history: np.ndarray, quantiles: np.ndarray) -> np.ndarray:
+        z = norm.ppf(quantiles)
+        last = history[:, -1]
+        out = last[:, np.newaxis, np.newaxis] + z[np.newaxis, :, np.newaxis]
+        return np.broadcast_to(out, (n_series, quantiles.shape[0], horizon)).copy()
+
+    return QuantileCVCallableAdapter(
+        predict_fn=predict_fn,
+        predict_quantiles_fn=predict_quantiles_fn,
+        horizon=horizon,
+        n_series=n_series,
+        cv_histories=cv_histories,
+        cv_truths=cv_truths,
+    )
+
+
+class TestCrossValidationPath:
+    """The CV fast path produces the same calibrated state as the loop path."""
+
+    def test_coverage_via_cv_path(self) -> None:
+        """End-to-end coverage check using the CV fast path."""
+        rng = np.random.default_rng(0)
+        n_series, horizon = 1, 1
+        alpha = 0.1
+        n_cal = 500
+        n_test = 500
+        T = 30
+        noise_std = 1.0
+
+        signal = rng.standard_normal(n_series) * 5.0
+
+        def predict_fn(history: np.ndarray) -> np.ndarray:
+            return np.broadcast_to(signal, (n_series, horizon)).copy()
+
+        def predict_quantiles_fn(history: np.ndarray, quantiles: np.ndarray) -> np.ndarray:
+            z = norm.ppf(quantiles)
+            out = signal[:, np.newaxis, np.newaxis] + z[np.newaxis, :, np.newaxis] * noise_std
+            return np.broadcast_to(out, (n_series, quantiles.shape[0], horizon)).copy()
+
+        cal_histories: list[np.ndarray] = []
+        cal_truths_list: list[np.ndarray] = []
+        for _ in range(n_cal):
+            history = signal[:, np.newaxis] + rng.normal(0, noise_std, (n_series, T))
+            truth = signal[:, np.newaxis] + rng.normal(0, noise_std, (n_series, horizon))
+            cal_histories.append(history)
+            cal_truths_list.append(truth)
+        cal_truths = np.stack(cal_truths_list, axis=1)
+
+        adapter = QuantileCVCallableAdapter(
+            predict_fn=predict_fn,
+            predict_quantiles_fn=predict_quantiles_fn,
+            horizon=horizon,
+            n_series=n_series,
+            cv_histories=cal_histories,
+            cv_truths=cal_truths,
+        )
+
+        method = ConformalizedQuantileRegression(adapter, alpha=alpha)
+        cal = method.calibrate(n_windows=n_cal, step_size=1)
+        assert cal.diagnostics["path"] == "cross_validation"
+        assert method.is_calibrated_
+
+        covered = 0
+        total = 0
+        for _ in range(n_test):
+            history = signal[:, np.newaxis] + rng.normal(0, noise_std, (n_series, T))
+            truth = signal[:, np.newaxis] + rng.normal(0, noise_std, (n_series, horizon))
+            result = method.predict(history)
+            lower = result.interval[..., 0]
+            upper = result.interval[..., 1]
+            truth_3d = truth[:, np.newaxis, :]
+            in_interval = (truth_3d >= lower) & (truth_3d <= upper)
+            covered += in_interval.sum()
+            total += in_interval.size
+        empirical_coverage = covered / total
+        assert abs(empirical_coverage - (1 - alpha)) < 0.03
+
+    def test_cv_path_matches_loop_path(self) -> None:
+        """CV and loop paths produce numerically equivalent score_quantile_.
+
+        The two paths perform the same arithmetic (predict_quantiles → score →
+        empirical quantile), but the CV path stacks via cross_validate_quantiles
+        whereas the loop path stacks via predict_quantiles + transpose. Because
+        the two call orders are different, floating-point ordering can produce
+        bit-level differences. We compare with ``np.allclose``'s default
+        tolerance, which is ample.
+        """
+        n_series, horizon = 2, 3
+        rng = np.random.default_rng(7)
+        n_cal = 100
+
+        cal_histories = [rng.standard_normal((n_series, 30)) for _ in range(n_cal)]
+        cal_truths = rng.standard_normal((n_series, n_cal, horizon))
+
+        adapter = _make_cv_adapter(n_series, horizon, cal_histories, cal_truths)
+
+        method_loop = ConformalizedQuantileRegression(adapter, alpha=0.1)
+        cal_loop = method_loop.calibrate(cal_histories, cal_truths)
+        assert cal_loop.diagnostics["path"] == "loop"
+
+        method_cv = ConformalizedQuantileRegression(adapter, alpha=0.1)
+        cal_cv = method_cv.calibrate(n_windows=n_cal, step_size=1)
+        assert cal_cv.diagnostics["path"] == "cross_validation"
+
+        assert np.allclose(cal_loop.score_quantile, cal_cv.score_quantile)
+        assert cal_loop.n_calibration_samples == cal_cv.n_calibration_samples
+
+
+class TestCalibrateDispatch:
+    """Routing between loop and CV paths based on input arguments."""
+
+    def _cv_adapter(self) -> QuantileCVCallableAdapter:
+        rng = np.random.default_rng(0)
+        n_series, horizon = 1, 1
+        n_cal = 50
+        cal_histories = [rng.standard_normal((n_series, 30)) for _ in range(n_cal)]
+        cal_truths = rng.standard_normal((n_series, n_cal, horizon))
+        return _make_cv_adapter(n_series, horizon, cal_histories, cal_truths)
+
+    def test_n_windows_dispatches_to_cv(self) -> None:
+        adapter = self._cv_adapter()
+        method = ConformalizedQuantileRegression(adapter, alpha=0.1)
+        cal = method.calibrate(n_windows=50, step_size=1)
+        assert cal.diagnostics["path"] == "cross_validation"
+
+    def test_histories_dispatches_to_loop(self) -> None:
+        adapter = self._cv_adapter()  # has CV capability, but we choose loop path
+        method = ConformalizedQuantileRegression(adapter, alpha=0.1)
+        cal = method.calibrate(adapter._cv_histories, adapter._cv_truths)
+        assert cal.diagnostics["path"] == "loop"
+
+    def test_both_calling_conventions_raise_value_error(self) -> None:
+        adapter = self._cv_adapter()
+        method = ConformalizedQuantileRegression(adapter, alpha=0.1)
+        with pytest.raises(ValueError, match="not both"):
+            method.calibrate(
+                adapter._cv_histories,
+                adapter._cv_truths,
+                n_windows=10,
+            )
+
+    def test_neither_calling_convention_raises_value_error(self) -> None:
+        adapter = self._cv_adapter()
+        method = ConformalizedQuantileRegression(adapter, alpha=0.1)
+        with pytest.raises(ValueError, match="histories, truths"):
+            method.calibrate()
+
+    def test_cv_path_on_non_cv_adapter_raises_value_error(self) -> None:
+        """Loop-only adapter + n_windows → ValueError naming the missing capability."""
+        loop_only_adapter = _make_const_quantile_adapter(1, 1)
+        method = ConformalizedQuantileRegression(loop_only_adapter, alpha=0.1)
+        with pytest.raises(ValueError, match="SupportsCrossValidationQuantiles"):
+            method.calibrate(n_windows=20)
+
+    def test_cv_path_on_runtime_gated_adapter_raises_unsupported(self) -> None:
+        """An adapter that declares the mixin but flips a runtime flag off
+        (mimicking NeuralForecast with a point loss) raises UnsupportedCapability
+        when the underlying ``cross_validate_quantiles`` is called."""
+
+        class GatedAdapter(QuantileCVCallableAdapter):
+            def cross_validate_quantiles(
+                self,
+                n_windows: int,
+                step_size: int,
+                quantiles: NDArray[np.floating],
+                refit: bool | int = False,
+            ) -> tuple[Forecast, Forecast]:
+                raise UnsupportedCapability(
+                    "Mock NeuralForecast-style adapter: non-probabilistic loss."
+                )
+
+        rng = np.random.default_rng(0)
+        n_series, horizon = 1, 1
+        cal_histories = [rng.standard_normal((n_series, 30)) for _ in range(20)]
+        cal_truths = rng.standard_normal((n_series, 20, horizon))
+
+        def predict_fn(history: np.ndarray) -> np.ndarray:
+            return np.repeat(history[:, -1:], horizon, axis=1)
+
+        def predict_quantiles_fn(history: np.ndarray, quantiles: np.ndarray) -> np.ndarray:
+            z = norm.ppf(quantiles)
+            last = history[:, -1]
+            out = last[:, np.newaxis, np.newaxis] + z[np.newaxis, :, np.newaxis]
+            return np.broadcast_to(out, (n_series, quantiles.shape[0], horizon)).copy()
+
+        adapter = GatedAdapter(
+            predict_fn=predict_fn,
+            predict_quantiles_fn=predict_quantiles_fn,
+            horizon=horizon,
+            n_series=n_series,
+            cv_histories=cal_histories,
+            cv_truths=cal_truths,
+        )
+        method = ConformalizedQuantileRegression(adapter, alpha=0.1)
+        with pytest.raises(UnsupportedCapability, match="non-probabilistic loss"):
+            method.calibrate(n_windows=20)

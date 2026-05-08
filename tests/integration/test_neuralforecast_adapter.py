@@ -18,14 +18,20 @@ import pytest
 nf_mod = pytest.importorskip("neuralforecast")
 NeuralForecast = nf_mod.NeuralForecast
 
-from neuralforecast.losses.pytorch import MAE  # noqa: E402
+from neuralforecast.losses.pytorch import (  # noqa: E402
+    MAE,
+    DistributionLoss,
+    MQLoss,
+)
 from neuralforecast.models import MLP, MLPMultivariate  # noqa: E402
 from neuralforecast.utils import PredictionIntervals  # noqa: E402
 
 from conformal_ts.adapters.neuralforecast import NeuralForecastAdapter  # noqa: E402
+from conformal_ts.base import UnsupportedCapability  # noqa: E402
 from conformal_ts.capabilities import (  # noqa: E402
     SupportsBootstrap,
     SupportsCrossValidation,
+    SupportsCrossValidationQuantiles,
     SupportsQuantiles,
     SupportsRefit,
 )
@@ -428,9 +434,19 @@ class TestCapabilities:
         adapter, _ = _make_adapter()
         assert isinstance(adapter, SupportsCrossValidation)
 
-    def test_not_supports_quantiles(self) -> None:
+    def test_supports_quantiles_class_level(self) -> None:
+        """SupportsQuantiles is always declared, regardless of the loss."""
         adapter, _ = _make_adapter()
-        assert not isinstance(adapter, SupportsQuantiles)
+        assert isinstance(adapter, SupportsQuantiles)
+
+    def test_supports_cross_validation_quantiles_class_level(self) -> None:
+        adapter, _ = _make_adapter()
+        assert isinstance(adapter, SupportsCrossValidationQuantiles)
+
+    def test_runtime_quantile_flag_false_for_point_loss(self) -> None:
+        adapter, _ = _make_adapter()
+        # Default _make_adapter uses MAE — a point loss.
+        assert adapter._supports_quantiles_runtime is False
 
     def test_not_supports_bootstrap(self) -> None:
         adapter, _ = _make_adapter()
@@ -458,3 +474,132 @@ class TestSplitConformalCV:
         assert result.interval.shape == (1, 1, 3, 2)
         assert np.all(result.interval[..., 0] <= result.point)
         assert np.all(result.point <= result.interval[..., 1])
+
+
+# ===========================================================================
+# Quantile-loss detection and runtime gating
+# ===========================================================================
+
+
+# Probabilistic-loss factories. Run only against the univariate MLP since
+# quantile capability is loss-driven, not architecture-driven, and
+# MLPMultivariate is already covered by the existing adapter tests.
+def _mqloss(quantiles: list[float]) -> MQLoss:
+    return MQLoss(quantiles=quantiles)
+
+
+def _normal_distribution_loss() -> DistributionLoss:
+    return DistributionLoss(distribution="Normal", level=[80, 90])
+
+
+class TestQuantileLossDetection:
+    """Constructor-time detection of quantile/distribution losses."""
+
+    def test_point_loss_runtime_flag_false(self) -> None:
+        adapter, _ = _make_adapter(kind="univariate")  # default MAE
+        assert adapter._supports_quantiles_runtime is False
+        assert adapter._loss_class_name == "MAE"
+
+    def test_quantile_loss_runtime_flag_true(self) -> None:
+        adapter, _ = _make_adapter(kind="univariate", loss=_mqloss([0.1, 0.5, 0.9]))
+        assert adapter._supports_quantiles_runtime is True
+        assert adapter._loss_class_name == "MQLoss"
+
+    def test_distribution_loss_runtime_flag_true(self) -> None:
+        adapter, _ = _make_adapter(kind="univariate", loss=_normal_distribution_loss())
+        assert adapter._supports_quantiles_runtime is True
+        assert adapter._loss_class_name == "DistributionLoss"
+
+
+class TestPredictQuantilesGated:
+    """predict_quantiles raises for point losses, returns shapes for probabilistic ones."""
+
+    def test_point_loss_raises_unsupported(self) -> None:
+        adapter, df = _make_adapter(kind="univariate", n_series=1, t_len=100)
+        history = adapter._df_to_panel(df, "y")
+        with pytest.raises(UnsupportedCapability, match="non-probabilistic loss"):
+            adapter.predict_quantiles(history, np.array([0.1, 0.9]))
+
+    def test_quantile_loss_returns_shape(self) -> None:
+        adapter, df = _make_adapter(
+            kind="univariate",
+            n_series=1,
+            horizon=3,
+            t_len=100,
+            loss=_mqloss([0.1, 0.5, 0.9]),
+        )
+        history = adapter._df_to_panel(df, "y")
+        result = adapter.predict_quantiles(history, np.array([0.1, 0.9]))
+        assert result.shape == (1, 2, 3)
+
+    def test_distribution_loss_returns_shape(self) -> None:
+        adapter, df = _make_adapter(
+            kind="univariate",
+            n_series=1,
+            horizon=3,
+            t_len=100,
+            loss=_normal_distribution_loss(),
+        )
+        history = adapter._df_to_panel(df, "y")
+        result = adapter.predict_quantiles(history, np.array([0.1, 0.9]))
+        assert result.shape == (1, 2, 3)
+
+    def test_quantile_not_in_loss_raises(self) -> None:
+        """MQLoss outputs only the quantiles it was trained with — requesting
+        a different symmetric pair must raise.
+
+        NeuralForecast's ``level=`` argument is honoured by ``DistributionLoss``
+        but ignored by ``MQLoss`` (which always emits the trained quantiles).
+        We train with a level-90 pair (0.05/0.95) and ask for a level-80 pair
+        (0.1/0.9); the output columns are level-90 only, so the level-80
+        lookup fails.
+        """
+        adapter, df = _make_adapter(
+            kind="univariate",
+            n_series=1,
+            horizon=3,
+            t_len=100,
+            loss=_mqloss([0.05, 0.5, 0.95]),
+        )
+        history = adapter._df_to_panel(df, "y")
+        with pytest.raises(ValueError, match="did not return quantile column"):
+            adapter.predict_quantiles(history, np.array([0.1, 0.9]))
+
+
+class TestCrossValidateQuantilesGated:
+    """cross_validate_quantiles raises for point losses, returns shapes for probabilistic ones."""
+
+    def test_point_loss_raises_unsupported(self) -> None:
+        adapter, _ = _make_adapter(kind="univariate", n_series=1, t_len=100)
+        with pytest.raises(UnsupportedCapability, match="non-probabilistic loss"):
+            adapter.cross_validate_quantiles(
+                n_windows=2, step_size=1, quantiles=np.array([0.1, 0.9])
+            )
+
+    def test_quantile_loss_returns_shape(self) -> None:
+        adapter, _ = _make_adapter(
+            kind="univariate",
+            n_series=1,
+            horizon=3,
+            t_len=100,
+            loss=_mqloss([0.1, 0.5, 0.9]),
+        )
+        preds, truths = adapter.cross_validate_quantiles(
+            n_windows=3, step_size=1, quantiles=np.array([0.1, 0.9])
+        )
+        assert preds.shape == (1, 3, 3, 2)
+        assert truths.shape == (1, 3, 3)
+
+    def test_distribution_loss_returns_shape(self) -> None:
+        adapter, _ = _make_adapter(
+            kind="univariate",
+            n_series=1,
+            horizon=3,
+            t_len=100,
+            loss=_normal_distribution_loss(),
+        )
+        preds, truths = adapter.cross_validate_quantiles(
+            n_windows=3, step_size=1, quantiles=np.array([0.1, 0.9])
+        )
+        assert preds.shape == (1, 3, 3, 2)
+        assert truths.shape == (1, 3, 3)

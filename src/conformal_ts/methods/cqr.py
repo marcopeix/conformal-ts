@@ -18,7 +18,7 @@ from ..base import (
     ScoreFunction,
     Series,
 )
-from ..capabilities import SupportsQuantiles
+from ..capabilities import SupportsCrossValidationQuantiles, SupportsQuantiles
 from ..nonconformity.quantile import QuantileScore
 
 
@@ -65,11 +65,25 @@ class ConformalizedQuantileRegression(ConformalMethod):
 
     Notes
     -----
-    **v0.1 limitation**: CQR currently calibrates by calling
-    ``forecaster.predict_quantiles`` once per calibration history. A
-    ``SupportsCrossValidationQuantiles`` fast path that mirrors
-    :class:`SplitConformal`'s ``cross_validate`` dispatch is tracked as
-    future work.
+    Calibration supports two calling conventions:
+
+    * **Loop path** — pass ``histories`` and ``truths``. The method calls
+      ``forecaster.predict_quantiles`` once per calibration window. Works
+      with any :class:`SupportsQuantiles` adapter (including library-agnostic
+      ``QuantileCallableAdapter``-style test adapters).
+    * **Cross-validation path** — pass ``n_windows`` (and optionally
+      ``step_size`` / ``refit``). Delegates to
+      ``forecaster.cross_validate_quantiles`` for a single library-native
+      call instead of N separate quantile predictions. Requires the adapter
+      to implement :class:`SupportsCrossValidationQuantiles`. For libraries
+      with a real CV implementation (StatsForecast, NeuralForecast, …),
+      this is dramatically faster than the loop path.
+
+    Dispatch happens in :meth:`calibrate` based on whether ``n_windows`` is
+    provided. Both paths produce numerically equivalent ``score_quantile_``
+    values when fed equivalent calibration data (within floating-point
+    ordering tolerance) and are reported in
+    ``CalibrationResult.diagnostics["path"]``.
     """
 
     REQUIRED_CAPABILITIES: tuple[type, ...] = (SupportsQuantiles,)
@@ -133,51 +147,71 @@ class ConformalizedQuantileRegression(ConformalMethod):
         """
         Fit the CQR conformal correction on a calibration set.
 
-        Only the explicit ``(histories, truths)`` calling convention is
-        supported in v0.1. The cross-validation fast path requires a
-        ``SupportsCrossValidationQuantiles`` capability that does not yet
-        exist; passing ``n_windows`` raises :class:`NotImplementedError`.
+        Two calling conventions are supported:
+
+        * Pass ``histories`` and ``truths`` (loop path). Works with any
+          :class:`SupportsQuantiles` adapter.
+        * Pass ``n_windows`` (and optionally ``step_size`` / ``refit``) to
+          delegate to ``forecaster.cross_validate_quantiles``. Requires the
+          adapter to implement :class:`SupportsCrossValidationQuantiles`.
 
         Parameters
         ----------
-        histories : list of Series
-            Each shape ``(n_series, T)``.
-        truths : Forecast
-            Shape ``(n_series, len(histories), horizon)``.
+        histories : list of Series, optional
+            Each shape ``(n_series, T)``. Required if ``n_windows`` is None.
+        truths : Forecast, optional
+            Shape ``(n_series, len(histories), horizon)``. Required if
+            ``n_windows`` is None.
         n_windows : int, optional
-            Not supported. Raises :class:`NotImplementedError` if set.
+            Number of CV windows.
         step_size : int
-            Unused in v0.1.
+            Step size between CV windows. Only used with ``n_windows``.
         refit : bool or int
-            Unused in v0.1.
+            Whether to refit between CV windows. Only used with ``n_windows``.
 
         Returns
         -------
         CalibrationResult
+            ``diagnostics["path"]`` is ``"loop"`` for the explicit
+            ``(histories, truths)`` form and ``"cross_validation"`` for the
+            ``n_windows`` form.
 
         Raises
         ------
         CalibrationError
             If fewer than ``ceil(1 / alpha)`` calibration samples are
-            provided.
-        NotImplementedError
-            If ``n_windows`` is provided (CV fast path is future work).
+            available.
         ValueError
-            If ``histories`` or ``truths`` is missing.
+            If neither calling convention is provided, both are provided, or
+            ``n_windows`` is requested on an adapter without
+            :class:`SupportsCrossValidationQuantiles`.
+        UnsupportedCapability
+            If ``n_windows`` is requested on an adapter that declares
+            :class:`SupportsCrossValidationQuantiles` but cannot deliver it
+            at runtime (e.g. NeuralForecast fit with a non-probabilistic
+            loss).
         """
         if n_windows is not None:
-            raise NotImplementedError(
-                "CQR cross-validation calibration is not supported in v0.1. "
-                "A SupportsCrossValidationQuantiles fast path is tracked as "
-                "future work. Pass explicit (histories, truths) instead."
-            )
+            if histories is not None or truths is not None:
+                raise ValueError("Provide either (histories, truths) or n_windows, not both.")
+            if not isinstance(self.forecaster, SupportsCrossValidationQuantiles):
+                raise ValueError(
+                    "calibrate(n_windows=...) requires an adapter implementing "
+                    f"SupportsCrossValidationQuantiles. Got "
+                    f"{type(self.forecaster).__name__}. Pass explicit "
+                    "(histories, truths) instead."
+                )
+            return self._calibrate_via_cv(n_windows=n_windows, step_size=step_size, refit=refit)
+
         if histories is None or truths is None:
-            raise ValueError("Must provide both histories and truths.")
+            raise ValueError("Must provide either (histories, truths) or n_windows.")
+        return self._calibrate_via_loop(histories=histories, truths=truths)
 
-        # step_size and refit are accepted for signature consistency with
-        # SplitConformal.calibrate but unused in the loop path.
-        del step_size, refit
-
+    def _calibrate_via_loop(
+        self,
+        histories: list[Series],
+        truths: Forecast,
+    ) -> CalibrationResult:
         n_cal = len(histories)
         min_samples = math.ceil(1.0 / self.alpha)
         if n_cal < min_samples:
@@ -219,6 +253,56 @@ class ConformalizedQuantileRegression(ConformalMethod):
                 "quantiles_used": self.quantiles_.tolist(),
                 "symmetric": self.symmetric,
                 "path": "loop",
+            },
+        )
+
+    def _calibrate_via_cv(
+        self,
+        n_windows: int,
+        step_size: int,
+        refit: bool | int,
+    ) -> CalibrationResult:
+        forecaster = self.forecaster
+        assert isinstance(forecaster, SupportsCrossValidationQuantiles)  # checked above
+
+        min_samples = math.ceil(1.0 / self.alpha)
+        if n_windows < min_samples:
+            raise CalibrationError(
+                f"Need at least ceil(1/alpha) = {min_samples} calibration "
+                f"samples for alpha={self.alpha}, got n_windows={n_windows}."
+            )
+
+        # cross_validate_quantiles returns quantiles on the LAST axis already,
+        # so the shape matches QuantileScore's expected input directly — no
+        # moveaxis needed (unlike the loop path, which has to transpose from
+        # the predict_quantiles convention).
+        quantile_predictions, truths = forecaster.cross_validate_quantiles(
+            n_windows=n_windows,
+            step_size=step_size,
+            quantiles=self.quantiles_,
+            refit=refit,
+        )
+        # quantile_predictions: (n_series, n_windows, horizon, 2)
+        # truths: (n_series, n_windows, horizon)
+
+        self.score_fn.fit(quantile_predictions, truths)
+        scores = self.score_fn.score(quantile_predictions, truths)
+        # (n_series, n_windows, horizon)
+
+        quantile_level = min(math.ceil((1 - self.alpha) * (n_windows + 1)) / n_windows, 1.0)
+
+        self.score_quantile_ = np.quantile(scores, quantile_level, axis=1)
+        self.n_calibration_samples_ = n_windows
+        self.is_calibrated_ = True
+
+        return CalibrationResult(
+            n_calibration_samples=n_windows,
+            score_quantile=self.score_quantile_.copy(),
+            diagnostics={
+                "quantile_level": quantile_level,
+                "quantiles_used": self.quantiles_.tolist(),
+                "symmetric": self.symmetric,
+                "path": "cross_validation",
             },
         )
 

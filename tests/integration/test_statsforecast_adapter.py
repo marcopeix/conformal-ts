@@ -15,6 +15,7 @@ from conformal_ts.adapters.statsforecast import StatsForecastAdapter  # noqa: E4
 from conformal_ts.capabilities import (  # noqa: E402
     SupportsBootstrap,
     SupportsCrossValidation,
+    SupportsCrossValidationQuantiles,
     SupportsQuantiles,
     SupportsRefit,
 )
@@ -305,9 +306,13 @@ class TestCapabilities:
         adapter, _ = _make_adapter()
         assert isinstance(adapter, SupportsCrossValidation)
 
-    def test_not_supports_quantiles(self) -> None:
+    def test_supports_quantiles(self) -> None:
         adapter, _ = _make_adapter()
-        assert not isinstance(adapter, SupportsQuantiles)
+        assert isinstance(adapter, SupportsQuantiles)
+
+    def test_supports_cross_validation_quantiles(self) -> None:
+        adapter, _ = _make_adapter()
+        assert isinstance(adapter, SupportsCrossValidationQuantiles)
 
     def test_not_supports_bootstrap(self) -> None:
         adapter, _ = _make_adapter()
@@ -316,6 +321,136 @@ class TestCapabilities:
 
 # ===========================================================================
 # SplitConformal calibration via cross_validate
+# ===========================================================================
+
+
+# ===========================================================================
+# Quantile prediction
+# ===========================================================================
+
+
+def _make_quantile_adapter(
+    n_series: int = 1,
+    t_len: int = 100,
+    horizon: int = 3,
+    freq: str = "D",
+) -> tuple[StatsForecastAdapter, pd.DataFrame]:
+    """Adapter backed by AutoETS — a model that supports level-based intervals."""
+    return _make_adapter(
+        n_series=n_series,
+        t_len=t_len,
+        horizon=horizon,
+        freq=freq,
+        model_cls=AutoETS,
+        season_length=1,
+    )
+
+
+class TestPredictQuantiles:
+    """predict_quantiles shape, validation, and column resolution."""
+
+    @pytest.mark.parametrize("quantiles", [[0.1, 0.9], [0.05, 0.95]])
+    def test_output_shape(self, quantiles: list[float]) -> None:
+        adapter, df = _make_quantile_adapter(n_series=2, horizon=4, t_len=100)
+        history = adapter._df_to_panel(df, "y")
+        result = adapter.predict_quantiles(history, np.array(quantiles))
+        assert result.shape == (2, len(quantiles), 4)
+        # Lower < Upper for symmetric pairs.
+        np.testing.assert_array_less(result[:, 0, :], result[:, 1, :])
+
+    def test_asymmetric_quantiles_rejected(self) -> None:
+        adapter, df = _make_quantile_adapter()
+        history = adapter._df_to_panel(df, "y")
+        with pytest.raises(ValueError, match="symmetric pair"):
+            adapter.predict_quantiles(history, np.array([0.1, 0.8]))
+
+    def test_median_rejected(self) -> None:
+        adapter, df = _make_quantile_adapter()
+        history = adapter._df_to_panel(df, "y")
+        with pytest.raises(ValueError, match="0.5 .median."):
+            adapter.predict_quantiles(history, np.array([0.1, 0.5, 0.9]))
+
+    def test_out_of_range_rejected(self) -> None:
+        adapter, df = _make_quantile_adapter()
+        history = adapter._df_to_panel(df, "y")
+        with pytest.raises(ValueError, match="0 < q < 1"):
+            adapter.predict_quantiles(history, np.array([0.0, 1.0]))
+
+    def test_missing_quantile_column_raises(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """If the underlying forecast output is missing the expected column, raise.
+
+        Most modern StatsForecast models (Naive, AutoETS, AutoARIMA, …) compute
+        analytical level-based intervals, so it is hard to elicit a missing
+        ``-lo-/-hi-`` column from a real fitted model. We monkey-patch the
+        StatsForecast ``forecast`` to drop interval columns, simulating the
+        case where the user picked a model that does not support level=.
+        """
+        adapter, df = _make_quantile_adapter(n_series=1, t_len=100, horizon=3)
+        history = adapter._df_to_panel(df, "y")
+
+        real_forecast = adapter._sf.forecast
+
+        def fake_forecast(*args: object, **kwargs: object) -> pd.DataFrame:
+            result = real_forecast(*args, **kwargs)
+            interval_cols = [c for c in result.columns if "-lo-" in c or "-hi-" in c]
+            return result.drop(columns=interval_cols)
+
+        monkeypatch.setattr(adapter._sf, "forecast", fake_forecast)
+
+        with pytest.raises(ValueError, match="did not return quantile column"):
+            adapter.predict_quantiles(history, np.array([0.05, 0.95]))
+
+
+class TestCrossValidateQuantiles:
+    """cross_validate_quantiles shapes, ordering, and refit behavior."""
+
+    def test_output_shapes(self) -> None:
+        adapter, _ = _make_quantile_adapter(n_series=2, horizon=3, t_len=100)
+        preds, truths = adapter.cross_validate_quantiles(
+            n_windows=4, step_size=1, quantiles=np.array([0.1, 0.9])
+        )
+        assert preds.shape == (2, 4, 3, 2)
+        assert truths.shape == (2, 4, 3)
+
+    def test_quantile_order_preserved(self) -> None:
+        """Output quantile axis follows the input order, not sorted."""
+        adapter, _ = _make_quantile_adapter(n_series=1, horizon=3, t_len=100)
+        preds_lo_hi, _ = adapter.cross_validate_quantiles(
+            n_windows=3, step_size=1, quantiles=np.array([0.1, 0.9])
+        )
+        preds_hi_lo, _ = adapter.cross_validate_quantiles(
+            n_windows=3, step_size=1, quantiles=np.array([0.9, 0.1])
+        )
+        # Reverse order of the last axis should yield the swapped result.
+        np.testing.assert_array_almost_equal(preds_lo_hi[..., ::-1], preds_hi_lo)
+
+    def test_refit_true_and_false_produce_shapes(self) -> None:
+        adapter, _ = _make_quantile_adapter(n_series=1, horizon=3, t_len=100)
+        p_no, _ = adapter.cross_validate_quantiles(
+            n_windows=3, step_size=1, quantiles=np.array([0.1, 0.9]), refit=False
+        )
+        p_yes, _ = adapter.cross_validate_quantiles(
+            n_windows=3, step_size=1, quantiles=np.array([0.1, 0.9]), refit=True
+        )
+        assert p_no.shape == p_yes.shape == (1, 3, 3, 2)
+
+    def test_invalid_n_windows_raises(self) -> None:
+        adapter, _ = _make_quantile_adapter()
+        with pytest.raises(ValueError, match="n_windows"):
+            adapter.cross_validate_quantiles(
+                n_windows=0, step_size=1, quantiles=np.array([0.1, 0.9])
+            )
+
+    def test_invalid_step_size_raises(self) -> None:
+        adapter, _ = _make_quantile_adapter()
+        with pytest.raises(ValueError, match="step_size"):
+            adapter.cross_validate_quantiles(
+                n_windows=2, step_size=0, quantiles=np.array([0.1, 0.9])
+            )
+
+
+# ===========================================================================
+# CQR end-to-end via the CV path is exercised in test_cqr_nixtla.py.
 # ===========================================================================
 
 

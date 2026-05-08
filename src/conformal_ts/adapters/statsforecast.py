@@ -6,13 +6,11 @@ Nixtla family of forecasting libraries.
 
 Scope
 -----
-The adapter only exposes the operations conformal methods consume internally:
-panel-shaped point forecasts, refit, and cross-validation. Quantile forecasts,
-bootstrap ensembles, and other library-native uncertainty outputs are out of
-scope — conformal-ts derives intervals from point forecasts. Methods that
-need quantile or bootstrap inputs (e.g. CQR family, EnbPI) accept those
-arrays directly from the user; generate them with StatsForecast and pass
-them to the method.
+The adapter exposes panel-shaped point forecasts, quantile forecasts, refit,
+and cross-validation — everything the current conformal methods consume from a
+StatsForecast model. Quantile support drives StatsForecast's level-based
+interval API (``<model>-lo-<level>`` / ``<model>-hi-<level>``). Bootstrap
+ensembles remain out of scope for v0.1.
 
 Limitations (v0.1)
 ------------------
@@ -21,6 +19,8 @@ Limitations (v0.1)
 - Only ``refit(history)`` is provided; no ``update_horizon`` or ``add_series``.
 - ``predict`` anchors forecasts at the adapter's known end timestamp. For
   forecasting from arbitrary recent data, call ``refit`` with a newer panel.
+- Quantile prediction requires symmetric quantile pairs; ``q == 0.5`` is
+  rejected because the StatsForecast level API has no median column.
 """
 
 from __future__ import annotations
@@ -31,7 +31,12 @@ import numpy as np
 from numpy.typing import NDArray
 
 from ..base import Forecast, ForecasterAdapter, Series
-from ..capabilities import SupportsCrossValidation, SupportsRefit
+from ..capabilities import (
+    SupportsCrossValidation,
+    SupportsCrossValidationQuantiles,
+    SupportsQuantiles,
+    SupportsRefit,
+)
 from . import _nixtla_common as _nx
 
 try:
@@ -51,6 +56,8 @@ class StatsForecastAdapter(
     ForecasterAdapter,
     SupportsRefit,
     SupportsCrossValidation,
+    SupportsQuantiles,
+    SupportsCrossValidationQuantiles,
 ):
     """
     Adapter for a fitted :class:`statsforecast.StatsForecast` instance.
@@ -284,4 +291,123 @@ class StatsForecastAdapter(
             time_col=self.time_col,
             n_series=self.n_series,
             horizon=self.horizon,
+        )
+
+    # ------------------------------------------------------------------
+    # SupportsQuantiles
+    # ------------------------------------------------------------------
+
+    def predict_quantiles(
+        self,
+        history: Series,
+        quantiles: NDArray[np.floating],
+    ) -> Forecast:
+        """
+        Produce quantile forecasts via StatsForecast's level-based interval API.
+
+        Parameters
+        ----------
+        history : Series, shape (n_series, T)
+        quantiles : NDArray, shape (n_quantiles,)
+            Values in ``(0, 1)``. Must come in symmetric pairs around 0.5;
+            ``q == 0.5`` is rejected.
+
+        Returns
+        -------
+        Forecast, shape (n_series, n_quantiles, horizon)
+            Quantiles are on the middle axis, in the order the user requested.
+
+        Raises
+        ------
+        ValueError
+            If quantiles fail the symmetric-pair / range checks, or if the
+            underlying model did not return a requested quantile column.
+        """
+        history = self._validate_history(history)
+        q_arr = np.asarray(quantiles, dtype=np.float64)
+        levels = _nx.quantiles_to_levels(q_arr)
+
+        history_df = self._panel_to_df(history, self._common_end)
+        result_df = self._sf.forecast(h=self.horizon, df=history_df, level=levels)
+
+        return _nx.stack_quantile_panels(
+            result_df,
+            model_name=self.model_name,
+            q_arr=q_arr,
+            resolver=_nx.sf_resolve_quantile_column,
+            series_ids=self._series_ids,
+            id_col=self.id_col,
+            time_col=self.time_col,
+        )
+
+    # ------------------------------------------------------------------
+    # SupportsCrossValidationQuantiles
+    # ------------------------------------------------------------------
+
+    def cross_validate_quantiles(
+        self,
+        n_windows: int,
+        step_size: int,
+        quantiles: NDArray[np.floating],
+        refit: bool | int = False,
+    ) -> tuple[Forecast, Forecast]:
+        """
+        Run rolling-origin cross-validation producing quantile forecasts.
+
+        Parameters
+        ----------
+        n_windows : int
+            Number of evaluation windows (>= 1).
+        step_size : int
+            Steps between successive windows (>= 1).
+        quantiles : NDArray, shape (n_quantiles,)
+            Values in ``(0, 1)``. Symmetric-pair / range rules of
+            :func:`_nixtla_common.quantiles_to_levels` apply.
+        refit : bool or int
+            Whether (or how often) to refit between windows.
+
+        Returns
+        -------
+        quantile_predictions : Forecast, shape (n_series, n_windows, horizon, n_quantiles)
+            Quantiles are on the **last axis**, in the order requested.
+        truths : Forecast, shape (n_series, n_windows, horizon)
+
+        Raises
+        ------
+        ValueError
+            If ``n_windows`` / ``step_size`` are invalid, the quantile
+            validation fails, or the model did not return a requested
+            quantile column.
+        RuntimeError
+            If the cross-validation output contains NaN.
+        """
+        if n_windows < 1:
+            raise ValueError(f"n_windows must be >= 1, got {n_windows}")
+        if step_size < 1:
+            raise ValueError(f"step_size must be >= 1, got {step_size}")
+
+        q_arr = np.asarray(quantiles, dtype=np.float64)
+        levels = _nx.quantiles_to_levels(q_arr)
+
+        cv_df = self._sf.cross_validation(
+            df=self._last_train_df,
+            h=self.horizon,
+            n_windows=n_windows,
+            step_size=step_size,
+            refit=refit,
+            level=levels,
+        )
+
+        return _nx.reshape_cv_quantiles(
+            cv_df,
+            model_name=self.model_name,
+            target_col=self.target_col,
+            q_arr=q_arr,
+            resolver=_nx.sf_resolve_quantile_column,
+            series_ids=self._series_ids,
+            id_col=self.id_col,
+            time_col=self.time_col,
+            n_series=self.n_series,
+            horizon=self.horizon,
+            library_name="StatsForecast",
         )
