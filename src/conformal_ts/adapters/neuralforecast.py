@@ -102,37 +102,6 @@ def _supports_quantiles(loss: Any) -> bool:
     return type(loss).__name__ in QUANTILE_LOSS_CLASS_NAMES
 
 
-def _resolve_quantile_column(model_name: str, columns: list[str], q: float) -> str:
-    """Find the NeuralForecast output column for a given quantile.
-
-    NeuralForecast's column naming convention varies across loss types and
-    versions. As of ``neuralforecast==3.1.x``:
-
-    * ``DistributionLoss`` produces ``<model>-lo-<level>`` / ``<model>-hi-<level>``
-      (no decimal suffix on the level).
-    * ``MQLoss`` and friends produce ``<model>-lo-<level>.0`` / ``<model>-hi-<level>.0``
-      (with a ``.0`` decimal suffix).
-
-    We try both conventions and return the first match. If neither column is
-    present, raise ``ValueError`` listing the candidates considered.
-    """
-    side = "lo" if q < 0.5 else "hi"
-    level = _nx.quantile_level(q)
-    candidates = [
-        f"{model_name}-{side}-{level}",
-        f"{model_name}-{side}-{level}.0",
-    ]
-    for candidate in candidates:
-        if candidate in columns:
-            return candidate
-    raise ValueError(
-        f"NeuralForecast did not return quantile column for q={q}. "
-        f"Tried {candidates}. Available columns: {columns}. For MQLoss, "
-        "the requested quantile must match a symmetric pair the loss was "
-        "trained with."
-    )
-
-
 class NeuralForecastAdapter(
     ForecasterAdapter,
     SupportsRefit,
@@ -483,13 +452,15 @@ class NeuralForecastAdapter(
         history_df = self._panel_to_df(history, self._common_end)
         result_df = self._nf.predict(df=history_df, level=levels)
 
-        columns = list(result_df.columns)
-        panels: list[NDArray[np.floating]] = []
-        for q in q_arr:
-            col = _resolve_quantile_column(self.model_name, columns, float(q))
-            panels.append(self._df_to_panel(result_df, col))  # (n_series, horizon)
-
-        return np.stack(panels, axis=1)  # (n_series, n_quantiles, horizon)
+        return _nx.stack_quantile_panels(
+            result_df,
+            model_name=self.model_name,
+            q_arr=q_arr,
+            resolver=_nx.nf_resolve_quantile_column,
+            series_ids=self._series_ids,
+            id_col=self.id_col,
+            time_col=self.time_col,
+        )
 
     # ------------------------------------------------------------------
     # SupportsCrossValidationQuantiles (runtime-gated)
@@ -550,21 +521,16 @@ class NeuralForecastAdapter(
             level=levels,
         )
 
-        truths = self._reshape_cv(cv_df, self.target_col)
-
-        columns = list(cv_df.columns)
-        panels: list[NDArray[np.floating]] = []
-        for q in q_arr:
-            col = _resolve_quantile_column(self.model_name, columns, float(q))
-            panels.append(self._reshape_cv(cv_df, col))
-
-        # (n_series, n_windows, horizon, n_quantiles)
-        quantile_predictions = np.stack(panels, axis=-1)
-
-        if np.isnan(quantile_predictions).any() or np.isnan(truths).any():
-            raise RuntimeError(
-                "cross_validation produced NaN values. This indicates an "
-                "internal error in the NeuralForecast cross-validation output."
-            )
-
-        return quantile_predictions, truths
+        return _nx.reshape_cv_quantiles(
+            cv_df,
+            model_name=self.model_name,
+            target_col=self.target_col,
+            q_arr=q_arr,
+            resolver=_nx.nf_resolve_quantile_column,
+            series_ids=self._series_ids,
+            id_col=self.id_col,
+            time_col=self.time_col,
+            n_series=self.n_series,
+            horizon=self.horizon,
+            library_name="NeuralForecast",
+        )

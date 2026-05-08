@@ -52,12 +52,6 @@ if TYPE_CHECKING:
     pass
 
 
-def _column_for_quantile(model_name: str, q: float) -> str:
-    """StatsForecast output column name for a given quantile (e.g. 0.05 → ``<model>-lo-90``)."""
-    side = "lo" if q < 0.5 else "hi"
-    return f"{model_name}-{side}-{_nx.quantile_level(q)}"
-
-
 class StatsForecastAdapter(
     ForecasterAdapter,
     SupportsRefit,
@@ -336,19 +330,15 @@ class StatsForecastAdapter(
         history_df = self._panel_to_df(history, self._common_end)
         result_df = self._sf.forecast(h=self.horizon, df=history_df, level=levels)
 
-        panels: list[NDArray[np.floating]] = []
-        for q in q_arr:
-            col = _column_for_quantile(self.model_name, float(q))
-            if col not in result_df.columns:
-                raise ValueError(
-                    f"StatsForecast did not return quantile column '{col}'. "
-                    f"Model '{self.model_name}' may not support quantile "
-                    "prediction. Use a model with native interval support "
-                    "(AutoARIMA, AutoETS, etc.)."
-                )
-            panels.append(self._df_to_panel(result_df, col))  # (n_series, horizon)
-
-        return np.stack(panels, axis=1)  # (n_series, n_quantiles, horizon)
+        return _nx.stack_quantile_panels(
+            result_df,
+            model_name=self.model_name,
+            q_arr=q_arr,
+            resolver=_nx.sf_resolve_quantile_column,
+            series_ids=self._series_ids,
+            id_col=self.id_col,
+            time_col=self.time_col,
+        )
 
     # ------------------------------------------------------------------
     # SupportsCrossValidationQuantiles
@@ -408,27 +398,16 @@ class StatsForecastAdapter(
             level=levels,
         )
 
-        truths = self._reshape_cv(cv_df, self.target_col)
-
-        panels: list[NDArray[np.floating]] = []
-        for q in q_arr:
-            col = _column_for_quantile(self.model_name, float(q))
-            if col not in cv_df.columns:
-                raise ValueError(
-                    f"StatsForecast did not return quantile column '{col}'. "
-                    f"Model '{self.model_name}' may not support quantile "
-                    "prediction. Use a model with native interval support "
-                    "(AutoARIMA, AutoETS, etc.)."
-                )
-            panels.append(self._reshape_cv(cv_df, col))
-
-        # (n_series, n_windows, horizon, n_quantiles)
-        quantile_predictions = np.stack(panels, axis=-1)
-
-        if np.isnan(quantile_predictions).any() or np.isnan(truths).any():
-            raise RuntimeError(
-                "cross_validation produced NaN values. This indicates an "
-                "internal error in the StatsForecast cross-validation output."
-            )
-
-        return quantile_predictions, truths
+        return _nx.reshape_cv_quantiles(
+            cv_df,
+            model_name=self.model_name,
+            target_col=self.target_col,
+            q_arr=q_arr,
+            resolver=_nx.sf_resolve_quantile_column,
+            series_ids=self._series_ids,
+            id_col=self.id_col,
+            time_col=self.time_col,
+            n_series=self.n_series,
+            horizon=self.horizon,
+            library_name="StatsForecast",
+        )

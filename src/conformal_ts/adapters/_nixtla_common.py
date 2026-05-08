@@ -14,11 +14,19 @@ thin instance-method shims that forward to them, which preserves the
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from typing import Any
 
 import numpy as np
 import pandas as pd  # type: ignore[import-untyped]
 from numpy.typing import NDArray
+
+# A library-specific resolver that maps (model_name, available_columns, q) to
+# the column name that holds the quantile-q forecast. Each Nixtla library
+# names columns differently (StatsForecast vs NeuralForecast vs MLForecast);
+# this signature lets ``reshape_cv_quantiles`` and ``stack_quantile_panels``
+# stay library-agnostic.
+ColumnResolver = Callable[[str, list[str], float], str]
 
 
 def quantiles_to_levels(quantiles: NDArray[np.floating]) -> list[int]:
@@ -79,6 +87,56 @@ def quantiles_to_levels(quantiles: NDArray[np.floating]) -> list[int]:
 def quantile_level(q: float) -> int:
     """Integer level for one quantile (e.g. 0.05 → 90)."""
     return int(round((1.0 - 2.0 * min(q, 1.0 - q)) * 100.0))
+
+
+def sf_resolve_quantile_column(model_name: str, columns: list[str], q: float) -> str:
+    """StatsForecast quantile column resolver.
+
+    StatsForecast uses a deterministic naming convention:
+    ``<model>-lo-<level>`` for ``q < 0.5`` and ``<model>-hi-<level>`` for
+    ``q > 0.5``. If the expected column is missing, raise with a
+    StatsForecast-specific message recommending interval-supporting models.
+    """
+    side = "lo" if q < 0.5 else "hi"
+    col = f"{model_name}-{side}-{quantile_level(q)}"
+    if col not in columns:
+        raise ValueError(
+            f"StatsForecast did not return quantile column '{col}'. "
+            f"Model '{model_name}' may not support quantile prediction. "
+            "Use a model with native interval support (AutoARIMA, AutoETS, etc.)."
+        )
+    return col
+
+
+def nf_resolve_quantile_column(model_name: str, columns: list[str], q: float) -> str:
+    """NeuralForecast quantile column resolver.
+
+    NeuralForecast's column naming differs across loss types and versions.
+    As of ``neuralforecast==3.1.x``:
+
+    * ``DistributionLoss`` produces ``<model>-lo-<level>`` / ``<model>-hi-<level>``
+      (no decimal suffix on the level).
+    * ``MQLoss`` and friends produce ``<model>-lo-<level>.0`` /
+      ``<model>-hi-<level>.0`` (with a ``.0`` decimal suffix).
+
+    We try both conventions and return the first match. If neither column
+    exists, raise ``ValueError`` listing the candidates considered.
+    """
+    side = "lo" if q < 0.5 else "hi"
+    level = quantile_level(q)
+    candidates = [
+        f"{model_name}-{side}-{level}",
+        f"{model_name}-{side}-{level}.0",
+    ]
+    for candidate in candidates:
+        if candidate in columns:
+            return candidate
+    raise ValueError(
+        f"NeuralForecast did not return quantile column for q={q}. "
+        f"Tried {candidates}. Available columns: {columns}. For MQLoss, "
+        "the requested quantile must match a symmetric pair the loss was "
+        "trained with."
+    )
 
 
 def validate_pandas(df: Any) -> None:
@@ -258,3 +316,106 @@ def reshape_cv(
         result[:, w_idx, :] = panel
 
     return result
+
+
+def reshape_cv_quantiles(
+    cv_df: pd.DataFrame,
+    *,
+    model_name: str,
+    target_col: str,
+    q_arr: NDArray[np.floating],
+    resolver: ColumnResolver,
+    series_ids: tuple[str, ...],
+    id_col: str,
+    time_col: str,
+    n_series: int,
+    horizon: int,
+    library_name: str,
+) -> tuple[NDArray[np.floating], NDArray[np.floating]]:
+    """Reshape a Nixtla-format quantile CV DataFrame.
+
+    Resolves the quantile column for each entry in ``q_arr`` via ``resolver``
+    (which encapsulates each library's column-name conventions and "missing
+    column" error message), reshapes truths and per-quantile panels via
+    :func:`reshape_cv`, and stacks the panels with quantiles on the **last
+    axis**. Raises ``RuntimeError`` if any output cell is NaN.
+
+    Returns
+    -------
+    quantile_predictions : NDArray, shape ``(n_series, n_windows, horizon, n_quantiles)``
+        Quantiles on the last axis, in the order of ``q_arr``.
+    truths : NDArray, shape ``(n_series, n_windows, horizon)``
+    """
+    columns = list(cv_df.columns)
+    truths = reshape_cv(
+        cv_df,
+        target_col,
+        series_ids=series_ids,
+        id_col=id_col,
+        time_col=time_col,
+        n_series=n_series,
+        horizon=horizon,
+    )
+
+    panels: list[NDArray[np.floating]] = []
+    for q in q_arr:
+        col = resolver(model_name, columns, float(q))
+        panels.append(
+            reshape_cv(
+                cv_df,
+                col,
+                series_ids=series_ids,
+                id_col=id_col,
+                time_col=time_col,
+                n_series=n_series,
+                horizon=horizon,
+            )
+        )
+    quantile_predictions = np.stack(panels, axis=-1)
+
+    if np.isnan(quantile_predictions).any() or np.isnan(truths).any():
+        raise RuntimeError(
+            f"{library_name} cross_validation produced NaN values. This "
+            f"indicates an internal error in the {library_name} "
+            "cross-validation output."
+        )
+
+    return quantile_predictions, truths
+
+
+def stack_quantile_panels(
+    result_df: pd.DataFrame,
+    *,
+    model_name: str,
+    q_arr: NDArray[np.floating],
+    resolver: ColumnResolver,
+    series_ids: tuple[str, ...],
+    id_col: str,
+    time_col: str,
+) -> NDArray[np.floating]:
+    """Read each requested quantile column from ``result_df`` and stack.
+
+    The forecast-side counterpart to :func:`reshape_cv_quantiles`. Used by
+    ``predict_quantiles`` on each Nixtla adapter: the upstream library has
+    just produced a wide DataFrame indexed by (id, ds) with one column per
+    quantile, and this helper pivots each requested quantile to a panel and
+    stacks them with quantiles on the **middle axis**.
+
+    Returns
+    -------
+    NDArray, shape ``(n_series, n_quantiles, horizon)``
+    """
+    columns = list(result_df.columns)
+    panels: list[NDArray[np.floating]] = []
+    for q in q_arr:
+        col = resolver(model_name, columns, float(q))
+        panels.append(
+            df_to_panel(
+                result_df,
+                col,
+                series_ids=series_ids,
+                id_col=id_col,
+                time_col=time_col,
+            )
+        )
+    return np.stack(panels, axis=1)
