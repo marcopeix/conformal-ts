@@ -369,13 +369,24 @@ class ConformalMethod(ABC):
         """
         ...
 
-    def update(self, truth: Forecast) -> None:
+    def update(self, prediction: Forecast, truth: Forecast) -> None:
         """
         Online update step. No-op for offline methods.
 
+        Online methods may need either ``truth`` alone (e.g. methods that just
+        track running statistics of the target) or both ``prediction`` and
+        ``truth`` together (e.g. ACI, which scores the realized residual at
+        update time). The contract therefore takes both; offline methods
+        ignore them.
+
         Parameters
         ----------
+        prediction : Forecast, shape (n_series, 1, horizon)
+            The point forecast that produced the interval the user is now
+            reporting an outcome for. Typically the ``point`` field of the
+            most recent :class:`PredictionResult`.
         truth : Forecast, shape (n_series, 1, horizon)
+            The realized values for the same horizon.
         """
         return None
 
