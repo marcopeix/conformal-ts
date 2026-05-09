@@ -78,9 +78,9 @@ class TestACIStatsForecast:
         assert cal.n_calibration_samples == n_cal
         # Calibration loop should drift alpha_t away from the initial value.
         initial_alpha = np.full_like(method.alpha_t_, alpha)
-        assert not np.allclose(
-            method.alpha_t_, initial_alpha
-        ), "alpha_t_ should drift from initial alpha after the calibration loop."
+        assert not np.allclose(method.alpha_t_, initial_alpha), (
+            "alpha_t_ should drift from initial alpha after the calibration loop."
+        )
 
         # Online holdout cycle. Refit at each step so the adapter's anchor
         # advances with new observations.

@@ -416,9 +416,9 @@ class TestOnlineAdaptation:
             result = method.predict(h)
             method.update(result.point, t[:, np.newaxis, :])
 
-        assert not np.allclose(
-            alpha_t_initial, method.alpha_t_
-        ), "alpha_t_ should evolve after 10 update cycles."
+        assert not np.allclose(alpha_t_initial, method.alpha_t_), (
+            "alpha_t_ should evolve after 10 update cycles."
+        )
 
     def test_predict_widens_after_miss(self) -> None:
         """Same input → wider interval after an update() that missed."""
@@ -445,9 +445,9 @@ class TestOnlineAdaptation:
         first_width = first.interval[..., 1] - first.interval[..., 0]
         second_width = second.interval[..., 1] - second.interval[..., 0]
         assert (second_width >= first_width).all()
-        assert (
-            second_width > first_width
-        ).any(), "Interval width should strictly increase after a miss-driven update."
+        assert (second_width > first_width).any(), (
+            "Interval width should strictly increase after a miss-driven update."
+        )
 
 
 # ===========================================================================
