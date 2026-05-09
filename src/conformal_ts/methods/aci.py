@@ -68,12 +68,11 @@ class AdaptiveConformalInference(ConformalMethod):
     Online lifecycle
     ----------------
     After ``calibrate``, callers alternate ``predict(history)`` and
-    ``update(truth)``. Each :meth:`predict` caches the most recent point
-    forecast internally; :meth:`update` consumes that cache to compute the
-    nonconformity score of the just-observed truth, append it to the score
-    history, and roll ``alpha_t`` forward. ``update`` therefore must be called
-    after a ``predict`` and before any subsequent ``update``; calling it twice
-    in a row, or before any ``predict``, raises :class:`RuntimeError`.
+    ``update(prediction, truth)``. ``update`` recomputes the nonconformity
+    score from the supplied ``(prediction, truth)`` pair, appends it to the
+    score history, and rolls ``alpha_t`` forward. The caller passes the same
+    ``point`` they got back from :class:`PredictionResult`, so there is no
+    hidden state coupling between ``predict`` and ``update``.
     """
 
     REQUIRED_CAPABILITIES: tuple[type, ...] = ()
@@ -98,9 +97,6 @@ class AdaptiveConformalInference(ConformalMethod):
             )
 
         self.gamma: float = float(gamma)
-        # Cache of the last point forecast emitted by predict(), consumed by
-        # the next update(). None means "no pending observation".
-        self._last_prediction_: Forecast | None = None
 
     def _default_score(self) -> ScoreFunction:
         return AbsoluteResidual()
@@ -276,7 +272,6 @@ class AdaptiveConformalInference(ConformalMethod):
         self.n_calibration_samples_: int = n_cal
         self.n_observations_: int = n_cal
         self.is_calibrated_ = True
-        self._last_prediction_ = None
 
     # ------------------------------------------------------------------
     # Per-cell quantile helper
@@ -356,9 +351,6 @@ class AdaptiveConformalInference(ConformalMethod):
         Unlike split CP, repeated ``predict`` calls with the same ``history``
         may return different intervals if :meth:`update` was called in
         between, because ``alpha_t_`` and ``scores_`` evolve over time.
-
-        The returned point forecast is also cached internally and consumed by
-        the next :meth:`update`.
         """
         if not self.is_calibrated_:
             raise CalibrationError("predict() called before calibrate(). Call calibrate() first.")
@@ -367,50 +359,46 @@ class AdaptiveConformalInference(ConformalMethod):
         threshold = self._current_threshold()  # (n_series, horizon)
         interval: Interval = self.score_fn.invert(point, threshold)
 
-        self._last_prediction_ = point
-
         return PredictionResult(point=point, interval=interval, alpha=self.alpha)
 
-    def update(self, truth: Forecast) -> None:
+    def update(self, prediction: Forecast, truth: Forecast) -> None:
         """
-        Roll ACI's online state forward with a new observation.
+        Roll ACI's online state forward with a new ``(prediction, truth)`` pair.
 
-        Must be called after a :meth:`predict` and before any subsequent
-        :meth:`update`. The truth corresponds to the horizon of the most
-        recent prediction.
+        Pass the ``point`` field of the :class:`PredictionResult` returned by
+        the corresponding :meth:`predict` call as ``prediction``, and the
+        realized values for the same horizon as ``truth``.
 
         Parameters
         ----------
+        prediction : Forecast, shape (n_series, 1, horizon)
         truth : Forecast, shape (n_series, 1, horizon)
 
         Raises
         ------
         CalibrationError
             If :meth:`calibrate` has not been called.
-        RuntimeError
-            If :meth:`predict` was not called since the last ``update`` (or
-            since calibration), so there is no cached prediction to score.
         ValueError
-            If ``truth`` does not have the expected shape.
+            If ``prediction`` and ``truth`` do not share the expected shape
+            ``(n_series, 1, horizon)``.
         """
         if not self.is_calibrated_:
             raise CalibrationError("update() called before calibrate(). Call calibrate() first.")
-        if self._last_prediction_ is None:
-            raise RuntimeError(
-                "update() requires a preceding predict() call. "
-                "Call predict(history) before update(truth)."
-            )
 
+        prediction_arr = np.asarray(prediction, dtype=np.float64)
         truth_arr = np.asarray(truth, dtype=np.float64)
-        expected_shape = self._last_prediction_.shape  # (n_series, 1, horizon)
-        if truth_arr.shape != expected_shape:
-            raise ValueError(
-                f"truth must have shape {expected_shape} (matching the most recent "
-                f"prediction), got {truth_arr.shape}."
-            )
 
-        # Score the just-observed truth against the cached prediction.
-        new_score = self.score_fn.score(self._last_prediction_, truth_arr)
+        n_series, _, horizon = self.scores_.shape
+        expected_shape = (n_series, 1, horizon)
+        if prediction_arr.shape != expected_shape:
+            raise ValueError(
+                f"prediction must have shape {expected_shape}, got {prediction_arr.shape}."
+            )
+        if truth_arr.shape != expected_shape:
+            raise ValueError(f"truth must have shape {expected_shape}, got {truth_arr.shape}.")
+
+        # Score the realized residual.
+        new_score = self.score_fn.score(prediction_arr, truth_arr)
         # (n_series, 1, horizon)
 
         # Coverage indicator under the alpha_t_ used to construct the interval
@@ -427,7 +415,3 @@ class AdaptiveConformalInference(ConformalMethod):
         self.scores_ = np.concatenate([self.scores_, new_score], axis=1)
         self.n_observations_ += 1
         self.alpha_t_ = self.alpha_t_ + self.gamma * (self.alpha - missed)
-
-        # Enforce the lifecycle: a fresh predict() is required before the
-        # next update().
-        self._last_prediction_ = None

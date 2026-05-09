@@ -104,7 +104,7 @@ class TestACIStatsForecast:
             covered += int(in_interval.sum())
             total += int(in_interval.size)
 
-            method.update(truth_3d)
+            method.update(result.point, truth_3d)
 
         coverage = covered / total
         assert abs(coverage - (1 - alpha)) < 0.06, (

@@ -134,7 +134,7 @@ def _run_online_cycle(
     for h, t_panel in zip(holdout_histories, holdout_truth_panels, strict=True):
         result = method.predict(h)
         intervals.append(result.interval.copy())
-        method.update(t_panel[:, np.newaxis, :])
+        method.update(result.point, t_panel[:, np.newaxis, :])
     return intervals
 
 
@@ -285,8 +285,9 @@ class TestDistributionShift:
         aci_intervals: list[np.ndarray] = []
         for h, t_panel in zip(ho_histories, ho_truth_panels, strict=True):
             split_intervals.append(method_split.predict(h).interval.copy())
-            aci_intervals.append(method_aci.predict(h).interval.copy())
-            method_aci.update(t_panel[:, np.newaxis, :])
+            aci_result = method_aci.predict(h)
+            aci_intervals.append(aci_result.interval.copy())
+            method_aci.update(aci_result.point, t_panel[:, np.newaxis, :])
 
         # Evaluate coverage on the second half — give ACI time to adapt.
         half = n_holdout // 2
@@ -412,8 +413,8 @@ class TestOnlineAdaptation:
         for _ in range(10):
             h = rng.normal(0.0, 1.0, (n_series, 30))
             t = rng.normal(0.0, 1.0, (n_series, horizon))
-            method.predict(h)
-            method.update(t[:, np.newaxis, :])
+            result = method.predict(h)
+            method.update(result.point, t[:, np.newaxis, :])
 
         assert not np.allclose(
             alpha_t_initial, method.alpha_t_
@@ -437,7 +438,7 @@ class TestOnlineAdaptation:
         first = method.predict(history)
         # Force a miss by passing a truth far outside the interval.
         huge_truth = np.array([[[1e6]]], dtype=np.float64)
-        method.update(huge_truth)
+        method.update(first.point, huge_truth)
 
         second = method.predict(history)
 
@@ -455,7 +456,7 @@ class TestOnlineAdaptation:
 
 
 class TestLifecycleErrors:
-    """Predict/update lifecycle constraints are enforced with clear errors."""
+    """predict/update precondition checks raise clear errors."""
 
     def _make_calibrated(self) -> AdaptiveConformalInference:
         rng = np.random.default_rng(0)
@@ -479,25 +480,19 @@ class TestLifecycleErrors:
         adapter = CallableAdapter(predict_fn=_zero_predict_fn(1, 1), horizon=1, n_series=1)
         method = AdaptiveConformalInference(adapter, alpha=0.1, gamma=0.05)
         with pytest.raises(CalibrationError, match="calibrate"):
-            method.update(np.zeros((1, 1, 1)))
+            method.update(np.zeros((1, 1, 1)), np.zeros((1, 1, 1)))
 
-    def test_update_without_predict_raises(self) -> None:
+    def test_update_with_wrong_truth_shape_raises(self) -> None:
         method = self._make_calibrated()
-        with pytest.raises(RuntimeError, match="predict"):
-            method.update(np.zeros((1, 1, 1)))
+        prediction = np.zeros((1, 1, 1))
+        with pytest.raises(ValueError, match="truth must have shape"):
+            method.update(prediction, np.zeros((1, 1)))  # missing horizon axis
 
-    def test_two_updates_in_a_row_raises(self) -> None:
+    def test_update_with_wrong_prediction_shape_raises(self) -> None:
         method = self._make_calibrated()
-        method.predict(np.zeros((1, 10)))
-        method.update(np.zeros((1, 1, 1)))
-        with pytest.raises(RuntimeError, match="predict"):
-            method.update(np.zeros((1, 1, 1)))
-
-    def test_update_with_wrong_shape_raises(self) -> None:
-        method = self._make_calibrated()
-        method.predict(np.zeros((1, 10)))
-        with pytest.raises(ValueError, match="shape"):
-            method.update(np.zeros((1, 1)))  # missing horizon axis
+        truth = np.zeros((1, 1, 1))
+        with pytest.raises(ValueError, match="prediction must have shape"):
+            method.update(np.zeros((1, 1)), truth)  # missing horizon axis
 
 
 # ===========================================================================
@@ -664,7 +659,6 @@ class TestFittedState:
         assert method.scores_.shape == (n_series, 50, horizon)
         assert method.n_calibration_samples_ == 50
         assert method.n_observations_ == 50
-        assert method._last_prediction_ is None
 
     def test_n_observations_grows_with_updates(self) -> None:
         rng = np.random.default_rng(0)
@@ -675,8 +669,8 @@ class TestFittedState:
         assert method.n_observations_ == 50
 
         for _ in range(7):
-            method.predict(np.zeros((1, 10)))
-            method.update(np.zeros((1, 1, 1)))
+            result = method.predict(np.zeros((1, 10)))
+            method.update(result.point, np.zeros((1, 1, 1)))
         assert method.n_observations_ == 57
         assert method.scores_.shape[1] == 57
         assert method.n_calibration_samples_ == 50  # unchanged
