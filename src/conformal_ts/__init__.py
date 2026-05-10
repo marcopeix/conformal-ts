@@ -9,6 +9,7 @@ from .methods import (
     AdaptiveConformalInference,
     AggregatedAdaptiveConformalInference,
     ConformalizedQuantileRegression,
+    NonexchangeableConformalPrediction,
     SplitConformal,
 )
 from .nonconformity import AbsoluteResidual, QuantileScore
@@ -24,6 +25,7 @@ __all__ = [
     "ConformalTSError",
     "ConformalizedQuantileRegression",
     "EWA",
+    "NonexchangeableConformalPrediction",
     "OnlineAggregator",
     "QuantileScore",
     "SplitConformal",
