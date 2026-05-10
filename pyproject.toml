@@ -32,7 +32,8 @@ nixtla = ["statsforecast>=1.7", "mlforecast>=0.13", "neuralforecast>=2.0"]
 darts = ["darts>=0.30"]
 sktime = ["sktime>=0.30"]
 plotting = ["matplotlib>=3.7"]
-all = ["conformal-ts[nixtla,darts,sktime,plotting]"]
+spci = ["quantile-forest>=1.4"]
+all = ["conformal-ts[nixtla,darts,sktime,plotting,spci]"]
 
 [project.urls]
 Homepage = "https://github.com/marcopeix/conformal-ts"

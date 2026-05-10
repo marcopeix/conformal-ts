@@ -10,9 +10,10 @@ from .methods import (
     AggregatedAdaptiveConformalInference,
     ConformalizedQuantileRegression,
     NonexchangeableConformalPrediction,
+    SequentialPredictiveConformalInference,
     SplitConformal,
 )
-from .nonconformity import AbsoluteResidual, QuantileScore
+from .nonconformity import AbsoluteResidual, QuantileScore, SignedResidual
 
 __version__ = "0.1.0"
 
@@ -28,6 +29,8 @@ __all__ = [
     "NonexchangeableConformalPrediction",
     "OnlineAggregator",
     "QuantileScore",
+    "SequentialPredictiveConformalInference",
+    "SignedResidual",
     "SplitConformal",
     "UnsupportedCapability",
 ]
