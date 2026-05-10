@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 from .adapters import CallableAdapter
+from .aggregators import EWA, OnlineAggregator
 from .base import CalibrationError, ConformalTSError, UnsupportedCapability
 from .methods import (
     AdaptiveConformalInference,
+    AggregatedAdaptiveConformalInference,
     ConformalizedQuantileRegression,
     SplitConformal,
 )
@@ -14,13 +16,16 @@ from .nonconformity import AbsoluteResidual, QuantileScore
 __version__ = "0.1.0"
 
 __all__ = [
-    "AdaptiveConformalInference",
-    "CallableAdapter",
-    "ConformalizedQuantileRegression",
-    "SplitConformal",
     "AbsoluteResidual",
-    "QuantileScore",
+    "AdaptiveConformalInference",
+    "AggregatedAdaptiveConformalInference",
     "CalibrationError",
+    "CallableAdapter",
     "ConformalTSError",
+    "ConformalizedQuantileRegression",
+    "EWA",
+    "OnlineAggregator",
+    "QuantileScore",
+    "SplitConformal",
     "UnsupportedCapability",
 ]
