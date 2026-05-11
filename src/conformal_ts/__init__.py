@@ -5,6 +5,7 @@ from __future__ import annotations
 from .adapters import CallableAdapter
 from .aggregators import EWA, OnlineAggregator
 from .base import CalibrationError, ConformalTSError, UnsupportedCapability
+from .diagnostics import Report, evaluate
 from .methods import (
     AdaptiveConformalInference,
     AggregatedAdaptiveConformalInference,
@@ -32,8 +33,10 @@ __all__ = [
     "QRFQuantileRegressor",
     "QuantileRegressor",
     "QuantileScore",
+    "Report",
     "SequentialPredictiveConformalInference",
     "SignedResidual",
     "SplitConformal",
     "UnsupportedCapability",
+    "evaluate",
 ]
