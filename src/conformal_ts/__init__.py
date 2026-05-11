@@ -12,7 +12,7 @@ from .methods import (
     NonexchangeableConformalPrediction,
     SplitConformal,
 )
-from .nonconformity import AbsoluteResidual, QuantileScore
+from .nonconformity import AbsoluteResidual, QuantileScore, SignedResidual
 
 __version__ = "0.1.0"
 
@@ -28,6 +28,7 @@ __all__ = [
     "NonexchangeableConformalPrediction",
     "OnlineAggregator",
     "QuantileScore",
+    "SignedResidual",
     "SplitConformal",
     "UnsupportedCapability",
 ]
