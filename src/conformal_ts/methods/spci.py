@@ -24,6 +24,7 @@ from ..capabilities import SupportsCrossValidation
 from ..nonconformity.signed import SignedResidual
 from ..quantile_regressors.base import QuantileRegressor
 from ..quantile_regressors.qrf import QRFQuantileRegressor
+from ._online_helpers import _validate_online_shapes
 
 
 def _default_regressor_factory() -> QuantileRegressor:
@@ -443,17 +444,8 @@ class SequentialPredictiveConformalInference(ConformalMethod):
         if not self.is_calibrated_:
             raise CalibrationError("update() called before calibrate(). Call calibrate() first.")
 
-        prediction_arr = np.asarray(prediction, dtype=np.float64)
-        truth_arr = np.asarray(truth, dtype=np.float64)
-
         n_series, _, horizon = self.residuals_.shape
-        expected_shape = (n_series, 1, horizon)
-        if prediction_arr.shape != expected_shape:
-            raise ValueError(
-                f"prediction must have shape {expected_shape}, got {prediction_arr.shape}."
-            )
-        if truth_arr.shape != expected_shape:
-            raise ValueError(f"truth must have shape {expected_shape}, got {truth_arr.shape}.")
+        prediction_arr, truth_arr = _validate_online_shapes(prediction, truth, n_series, horizon)
 
         new_residual = self.score_fn.score(prediction_arr, truth_arr)
         # (n_series, 1, horizon)

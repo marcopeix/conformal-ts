@@ -22,6 +22,7 @@ from ..base import (
 )
 from ..capabilities import SupportsCrossValidation
 from ..nonconformity.absolute import AbsoluteResidual
+from ._online_helpers import _per_cell_quantile, _validate_online_shapes
 
 
 def _default_aggregator_factory(n_experts: int, n_series: int, horizon: int) -> OnlineAggregator:
@@ -289,7 +290,7 @@ class AggregatedAdaptiveConformalInference(ConformalMethod):
                 # (K, n_series, horizon)
                 thresholds = np.empty((K, n_series, horizon), dtype=np.float64)
                 for k in range(K):
-                    thresholds[k] = self._per_cell_quantile(past_scores, quantile_levels[k])
+                    thresholds[k] = _per_cell_quantile(past_scores, quantile_levels[k])
                 lower_bounds = point_t[None, :, :] - thresholds
                 upper_bounds = point_t[None, :, :] + thresholds
             else:
@@ -325,44 +326,6 @@ class AggregatedAdaptiveConformalInference(ConformalMethod):
     # Helpers
     # ------------------------------------------------------------------
 
-    def _per_cell_quantile(
-        self,
-        scores: NDArray[np.floating],
-        quantile_levels: NDArray[np.floating],
-    ) -> NDArray[np.floating]:
-        """
-        Per-(series, horizon) quantile of an observed-score panel.
-
-        Parameters
-        ----------
-        scores : NDArray, shape (n_series, t, horizon)
-        quantile_levels : NDArray, shape (n_series, horizon)
-
-        Returns
-        -------
-        NDArray, shape (n_series, horizon)
-            ``out[s, h] = np.quantile(scores[s, :, h], quantile_levels[s, h])``
-            with saturation at the level boundaries.
-
-        Notes
-        -----
-        This helper is duplicated from
-        :meth:`AdaptiveConformalInference._per_cell_quantile`. Both are
-        candidates for a future refactor into ``methods/_online_helpers.py``.
-        """
-        n_series, _, horizon = scores.shape
-        out = np.empty((n_series, horizon), dtype=np.float64)
-        for s in range(n_series):
-            for h in range(horizon):
-                ql = float(quantile_levels[s, h])
-                if ql >= 1.0:
-                    out[s, h] = np.finfo(np.float64).max
-                elif ql <= 0.0:
-                    out[s, h] = -np.finfo(np.float64).max
-                else:
-                    out[s, h] = float(np.quantile(scores[s, :, h], ql))
-        return out
-
     @staticmethod
     def _pinball_loss(
         truth: NDArray[np.floating],
@@ -388,7 +351,7 @@ class AggregatedAdaptiveConformalInference(ConformalMethod):
         quantile_levels = np.clip(1.0 - self.alpha_t_per_expert_, 0.0, 1.0)
         thresholds = np.empty((K, n_series, horizon), dtype=np.float64)
         for k in range(K):
-            thresholds[k] = self._per_cell_quantile(self.scores_, quantile_levels[k])
+            thresholds[k] = _per_cell_quantile(self.scores_, quantile_levels[k])
         return thresholds
 
     # ------------------------------------------------------------------
@@ -406,7 +369,7 @@ class AggregatedAdaptiveConformalInference(ConformalMethod):
         quantile_levels = np.clip(1.0 - self.alpha_t_per_expert_, 0.0, 1.0)
         thresholds = np.empty((K, n_series, horizon), dtype=np.float64)
         for k in range(K):
-            thresholds[k] = self._per_cell_quantile(scores, quantile_levels[k])
+            thresholds[k] = _per_cell_quantile(scores, quantile_levels[k])
         lower_bounds = point_squeezed[None, :, :] - thresholds
         upper_bounds = point_squeezed[None, :, :] + thresholds
         lower_bounds = np.maximum(lower_bounds, self.interval_clip_lower_)
@@ -484,17 +447,8 @@ class AggregatedAdaptiveConformalInference(ConformalMethod):
         if not self.is_calibrated_:
             raise CalibrationError("update() called before calibrate(). Call calibrate() first.")
 
-        prediction_arr = np.asarray(prediction, dtype=np.float64)
-        truth_arr = np.asarray(truth, dtype=np.float64)
-
         n_series, _, horizon = self.scores_.shape
-        expected_shape = (n_series, 1, horizon)
-        if prediction_arr.shape != expected_shape:
-            raise ValueError(
-                f"prediction must have shape {expected_shape}, got {prediction_arr.shape}."
-            )
-        if truth_arr.shape != expected_shape:
-            raise ValueError(f"truth must have shape {expected_shape}, got {truth_arr.shape}.")
+        prediction_arr, truth_arr = _validate_online_shapes(prediction, truth, n_series, horizon)
 
         # Recompute the per-expert bounds the user observed: these used the
         # alpha_t before this update and the score history before this step.
