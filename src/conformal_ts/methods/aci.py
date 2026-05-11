@@ -22,6 +22,7 @@ from ..base import (
 )
 from ..capabilities import SupportsCrossValidation
 from ..nonconformity.absolute import AbsoluteResidual
+from ._online_helpers import _per_cell_quantile, _validate_online_shapes
 
 
 class AdaptiveConformalInference(ConformalMethod):
@@ -256,7 +257,7 @@ class AdaptiveConformalInference(ConformalMethod):
             if t > 0:
                 past_scores = all_scores[:, :t, :]  # (n_series, t, horizon)
                 quantile_levels = np.clip(1.0 - alpha_t, 0.0, 1.0)
-                threshold = self._per_cell_quantile(past_scores, quantile_levels)
+                threshold = _per_cell_quantile(past_scores, quantile_levels)
                 missed = (current_score > threshold).astype(np.float64)
             else:
                 # No past scores at t=0. Following Gibbs & Candès' online
@@ -277,51 +278,10 @@ class AdaptiveConformalInference(ConformalMethod):
     # Per-cell quantile helper
     # ------------------------------------------------------------------
 
-    def _per_cell_quantile(
-        self,
-        scores: NDArray[np.floating],
-        quantile_levels: NDArray[np.floating],
-    ) -> NDArray[np.floating]:
-        """
-        Per-(series, horizon) quantile of an observed-score panel.
-
-        Parameters
-        ----------
-        scores : NDArray, shape (n_series, t, horizon)
-            Time-axis is axis 1.
-        quantile_levels : NDArray, shape (n_series, horizon)
-            Quantile level per cell, in ``[0, 1]``.
-
-        Returns
-        -------
-        NDArray, shape (n_series, horizon)
-            ``out[s, h] = np.quantile(scores[s, :, h], quantile_levels[s, h])``
-            with saturation at the level boundaries.
-
-        Notes
-        -----
-        The nested-loop implementation is O(n_series * horizon * t log t).
-        Vectorising via ``np.sort`` + ``searchsorted`` on a per-cell quantile
-        index is a known optimisation opportunity, deferred until profiling
-        flags it.
-        """
-        n_series, _, horizon = scores.shape
-        out = np.empty((n_series, horizon), dtype=np.float64)
-        for s in range(n_series):
-            for h in range(horizon):
-                ql = float(quantile_levels[s, h])
-                if ql >= 1.0:
-                    out[s, h] = np.finfo(np.float64).max
-                elif ql <= 0.0:
-                    out[s, h] = -np.finfo(np.float64).max
-                else:
-                    out[s, h] = float(np.quantile(scores[s, :, h], ql))
-        return out
-
     def _current_threshold(self) -> NDArray[np.floating]:
         """Score threshold per (series, horizon) at the current ``alpha_t_``."""
         quantile_levels = np.clip(1.0 - self.alpha_t_, 0.0, 1.0)
-        return self._per_cell_quantile(self.scores_, quantile_levels)
+        return _per_cell_quantile(self.scores_, quantile_levels)
 
     # ------------------------------------------------------------------
     # Predict / update
@@ -385,17 +345,8 @@ class AdaptiveConformalInference(ConformalMethod):
         if not self.is_calibrated_:
             raise CalibrationError("update() called before calibrate(). Call calibrate() first.")
 
-        prediction_arr = np.asarray(prediction, dtype=np.float64)
-        truth_arr = np.asarray(truth, dtype=np.float64)
-
         n_series, _, horizon = self.scores_.shape
-        expected_shape = (n_series, 1, horizon)
-        if prediction_arr.shape != expected_shape:
-            raise ValueError(
-                f"prediction must have shape {expected_shape}, got {prediction_arr.shape}."
-            )
-        if truth_arr.shape != expected_shape:
-            raise ValueError(f"truth must have shape {expected_shape}, got {truth_arr.shape}.")
+        prediction_arr, truth_arr = _validate_online_shapes(prediction, truth, n_series, horizon)
 
         # Score the realized residual.
         new_score = self.score_fn.score(prediction_arr, truth_arr)
@@ -405,7 +356,7 @@ class AdaptiveConformalInference(ConformalMethod):
         # the user just observed. Use the score history *before* appending
         # this new observation, matching the calibration loop's convention.
         quantile_levels = np.clip(1.0 - self.alpha_t_, 0.0, 1.0)
-        threshold = self._per_cell_quantile(self.scores_, quantile_levels)
+        threshold = _per_cell_quantile(self.scores_, quantile_levels)
         # (n_series, horizon)
 
         missed = (new_score[:, 0, :] > threshold).astype(np.float64)

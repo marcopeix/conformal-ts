@@ -11,120 +11,18 @@ from conformal_ts.adapters.callable import CallableAdapter
 from conformal_ts.aggregators import EWA, OnlineAggregator
 from conformal_ts.base import (
     CalibrationError,
-    Forecast,
-    Series,
     UnsupportedCapability,
 )
-from conformal_ts.capabilities import SupportsCrossValidation
 from conformal_ts.methods.aci import AdaptiveConformalInference
 from conformal_ts.methods.agaci import AggregatedAdaptiveConformalInference
-
-
-# ---------------------------------------------------------------------------
-# Test fixtures
-# ---------------------------------------------------------------------------
-
-
-def _zero_predict_fn(n_series: int, horizon: int):
-    def predict_fn(history: np.ndarray) -> np.ndarray:
-        return np.zeros((n_series, horizon))
-
-    return predict_fn
-
-
-def _last_value_predict_fn(horizon: int):
-    def predict_fn(history: np.ndarray) -> np.ndarray:
-        return np.repeat(history[:, -1:], horizon, axis=1)
-
-    return predict_fn
-
-
-class CVCallableAdapter(CallableAdapter, SupportsCrossValidation):
-    """Test-only callable adapter that exposes rolling-origin CV via a panel."""
-
-    def __init__(
-        self,
-        predict_fn,
-        training_panel: np.ndarray,
-        horizon: int,
-    ) -> None:
-        super().__init__(
-            predict_fn=predict_fn,
-            horizon=horizon,
-            n_series=training_panel.shape[0],
-        )
-        self._training_panel = np.asarray(training_panel, dtype=np.float64)
-
-    def cross_validate(
-        self,
-        n_windows: int,
-        step_size: int = 1,
-        refit: bool | int = False,
-    ) -> tuple[Forecast, Forecast]:
-        T = self._training_panel.shape[1]
-        preds: list[np.ndarray] = []
-        truths: list[np.ndarray] = []
-        for i in range(n_windows):
-            cutoff = T - self.horizon - (n_windows - 1 - i) * step_size
-            if cutoff < 1:
-                raise ValueError(
-                    f"training panel too short: cutoff={cutoff} for window {i}, "
-                    f"n_windows={n_windows}, step_size={step_size}, horizon={self.horizon}, T={T}."
-                )
-            history = self._training_panel[:, :cutoff]
-            truth = self._training_panel[:, cutoff : cutoff + self.horizon]
-            pred = self.predict(history)
-            preds.append(pred)
-            truths.append(truth[:, np.newaxis, :])
-        return np.concatenate(preds, axis=1), np.concatenate(truths, axis=1)
-
-    def cv_window_history(self, n_windows: int, step_size: int, window_index: int) -> np.ndarray:
-        T = self._training_panel.shape[1]
-        cutoff = T - self.horizon - (n_windows - 1 - window_index) * step_size
-        return self._training_panel[:, :cutoff]
-
-
-def _make_iid_dataset(
-    rng: np.random.Generator,
-    n_series: int,
-    horizon: int,
-    n_samples: int,
-    noise_std: float,
-    history_len: int = 30,
-) -> tuple[list[Series], np.ndarray, list[np.ndarray]]:
-    histories: list[Series] = []
-    truth_panels: list[np.ndarray] = []
-    for _ in range(n_samples):
-        h = rng.normal(0.0, noise_std, (n_series, history_len))
-        t = rng.normal(0.0, noise_std, (n_series, horizon))
-        histories.append(h)
-        truth_panels.append(t)
-    truths = np.stack(truth_panels, axis=1)
-    return histories, truths, truth_panels
-
-
-def _run_online_cycle(
-    method: AggregatedAdaptiveConformalInference,
-    holdout_histories: list[Series],
-    holdout_truth_panels: list[np.ndarray],
-) -> list[np.ndarray]:
-    intervals: list[np.ndarray] = []
-    for h, t_panel in zip(holdout_histories, holdout_truth_panels, strict=True):
-        result = method.predict(h)
-        intervals.append(result.interval.copy())
-        method.update(result.point, t_panel[:, np.newaxis, :])
-    return intervals
-
-
-def _empirical_coverage(intervals: list[np.ndarray], truth_panels: list[np.ndarray]) -> float:
-    covered = 0
-    total = 0
-    for interval, truth in zip(intervals, truth_panels, strict=True):
-        truth_3d = truth[:, np.newaxis, :]
-        in_interval = (truth_3d >= interval[..., 0]) & (truth_3d <= interval[..., 1])
-        covered += int(in_interval.sum())
-        total += int(in_interval.size)
-    return covered / total
+from tests._online_helpers import (
+    CVCallableAdapter,
+    _empirical_coverage,
+    _last_value_predict_fn,
+    _make_iid_dataset,
+    _run_online_cycle,
+    _zero_predict_fn,
+)
 
 
 # ===========================================================================

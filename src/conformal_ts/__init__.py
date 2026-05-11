@@ -10,9 +10,11 @@ from .methods import (
     AggregatedAdaptiveConformalInference,
     ConformalizedQuantileRegression,
     NonexchangeableConformalPrediction,
+    SequentialPredictiveConformalInference,
     SplitConformal,
 )
 from .nonconformity import AbsoluteResidual, QuantileScore, SignedResidual
+from .quantile_regressors import QRFQuantileRegressor, QuantileRegressor
 
 __version__ = "0.1.0"
 
@@ -27,7 +29,10 @@ __all__ = [
     "EWA",
     "NonexchangeableConformalPrediction",
     "OnlineAggregator",
+    "QRFQuantileRegressor",
+    "QuantileRegressor",
     "QuantileScore",
+    "SequentialPredictiveConformalInference",
     "SignedResidual",
     "SplitConformal",
     "UnsupportedCapability",

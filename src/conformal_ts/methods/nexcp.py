@@ -20,6 +20,7 @@ from ..base import (
 )
 from ..capabilities import SupportsCrossValidation
 from ..nonconformity.absolute import AbsoluteResidual
+from ._online_helpers import _validate_online_shapes
 
 
 class NonexchangeableConformalPrediction(ConformalMethod):
@@ -361,17 +362,8 @@ class NonexchangeableConformalPrediction(ConformalMethod):
         if not self.is_calibrated_:
             raise CalibrationError("update() called before calibrate(). Call calibrate() first.")
 
-        prediction_arr = np.asarray(prediction, dtype=np.float64)
-        truth_arr = np.asarray(truth, dtype=np.float64)
-
         n_series, _, horizon = self.scores_.shape
-        expected_shape = (n_series, 1, horizon)
-        if prediction_arr.shape != expected_shape:
-            raise ValueError(
-                f"prediction must have shape {expected_shape}, got {prediction_arr.shape}."
-            )
-        if truth_arr.shape != expected_shape:
-            raise ValueError(f"truth must have shape {expected_shape}, got {truth_arr.shape}.")
+        prediction_arr, truth_arr = _validate_online_shapes(prediction, truth, n_series, horizon)
 
         new_score = self.score_fn.score(prediction_arr, truth_arr)
         self.scores_ = np.concatenate([self.scores_, new_score], axis=1)

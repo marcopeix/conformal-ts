@@ -6,6 +6,7 @@ from .aci import AdaptiveConformalInference
 from .agaci import AggregatedAdaptiveConformalInference
 from .cqr import ConformalizedQuantileRegression
 from .nexcp import NonexchangeableConformalPrediction
+from .spci import SequentialPredictiveConformalInference
 from .split import SplitConformal
 
 __all__ = [
@@ -13,5 +14,6 @@ __all__ = [
     "AggregatedAdaptiveConformalInference",
     "ConformalizedQuantileRegression",
     "NonexchangeableConformalPrediction",
+    "SequentialPredictiveConformalInference",
     "SplitConformal",
 ]
