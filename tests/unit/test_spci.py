@@ -838,3 +838,66 @@ class TestFittedState:
         assert method.n_observations_ == 50
         # one regressor per (series, horizon) cell
         assert len(method.quantile_regressors_) == n_series * horizon
+
+    def test_stores_calibration_data(self) -> None:
+        rng = np.random.default_rng(0)
+        n_series, horizon = 2, 3
+        adapter = CallableAdapter(
+            predict_fn=_zero_predict_fn(n_series, horizon),
+            horizon=horizon,
+            n_series=n_series,
+        )
+        method = SequentialPredictiveConformalInference(
+            adapter,
+            alpha=0.1,
+            window_size=10,
+            regressor_factory=mock_factory,
+        )
+        histories, truths, _ = _make_iid_dataset(rng, n_series, horizon, 50, 1.0)
+        method.calibrate(histories, truths)
+
+        assert method.predictions_calibration_.shape == (n_series, 50, horizon)
+        assert method.truths_calibration_.shape == (n_series, 50, horizon)
+        np.testing.assert_allclose(method.truths_calibration_, truths)
+
+    def test_calibration_data_is_defensive_copy(self) -> None:
+        rng = np.random.default_rng(0)
+        adapter = CallableAdapter(predict_fn=_zero_predict_fn(1, 1), horizon=1, n_series=1)
+        method = SequentialPredictiveConformalInference(
+            adapter,
+            alpha=0.1,
+            window_size=10,
+            regressor_factory=mock_factory,
+        )
+        histories, truths, _ = _make_iid_dataset(rng, 1, 1, 50, 1.0)
+        method.calibrate(histories, truths)
+
+        residuals_before = method.residuals_.copy()
+        method.predictions_calibration_[...] = 0.0
+        method.truths_calibration_[...] = 0.0
+        np.testing.assert_array_equal(method.residuals_, residuals_before)
+
+
+class TestIntervalsFromPredictions:
+    def test_shape_matches_panel(self) -> None:
+        rng = np.random.default_rng(0)
+        n_series, horizon = 2, 3
+        adapter = CallableAdapter(
+            predict_fn=_zero_predict_fn(n_series, horizon),
+            horizon=horizon,
+            n_series=n_series,
+        )
+        method = SequentialPredictiveConformalInference(
+            adapter,
+            alpha=0.1,
+            window_size=10,
+            regressor_factory=mock_factory,
+            beta_grid_size=5,
+        )
+        histories, truths, _ = _make_iid_dataset(rng, n_series, horizon, 50, 1.0)
+        method.calibrate(histories, truths)
+
+        intervals = method._intervals_from_predictions(method.predictions_calibration_)
+        assert intervals.shape == (n_series, 50, horizon, 2)
+        # Lower <= upper for every cell.
+        assert (intervals[..., 0] <= intervals[..., 1]).all()

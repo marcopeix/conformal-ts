@@ -5,7 +5,7 @@ from __future__ import annotations
 from .adapters import CallableAdapter
 from .aggregators import EWA, OnlineAggregator
 from .base import CalibrationError, ConformalTSError, UnsupportedCapability
-from .diagnostics import Report, evaluate
+from .diagnostics import Report, evaluate, evaluate_calibration
 from .methods import (
     AdaptiveConformalInference,
     AggregatedAdaptiveConformalInference,
@@ -39,4 +39,5 @@ __all__ = [
     "SplitConformal",
     "UnsupportedCapability",
     "evaluate",
+    "evaluate_calibration",
 ]

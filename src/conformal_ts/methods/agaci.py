@@ -15,6 +15,7 @@ from ..base import (
     ConformalMethod,
     Forecast,
     ForecasterAdapter,
+    Interval,
     PredictionResult,
     ScoreFunction,
     Series,
@@ -320,6 +321,11 @@ class AggregatedAdaptiveConformalInference(ConformalMethod):
         self.scores_: NDArray[np.floating] = all_scores
         self.n_calibration_samples_: int = n_cal
         self.n_observations_: int = n_cal
+        # Retain calibration data for Mode 1 diagnostics.
+        self.predictions_calibration_: NDArray[np.floating] = np.asarray(
+            predictions, dtype=np.float64
+        ).copy()
+        self.truths_calibration_: NDArray[np.floating] = np.asarray(truths, dtype=np.float64).copy()
         self.is_calibrated_ = True
 
     # ------------------------------------------------------------------
@@ -419,6 +425,45 @@ class AggregatedAdaptiveConformalInference(ConformalMethod):
             axis=-1,
         )
         return PredictionResult(point=point, interval=interval, alpha=self.alpha)
+
+    def _intervals_from_predictions(self, predictions: Forecast) -> Interval:
+        """
+        Aggregate per-expert bounds across the panel of calibration predictions.
+
+        Used by :func:`conformal_ts.diagnostics.evaluate_calibration`. The
+        per-expert thresholds and aggregator weights are the post-calibration
+        snapshots, so coverage estimates from this function are in-sample and
+        generally optimistic.
+
+        Parameters
+        ----------
+        predictions : Forecast, shape (n_series, n_samples, horizon)
+
+        Returns
+        -------
+        Interval, shape (n_series, n_samples, horizon, 2)
+        """
+        K = self.n_experts
+        n_series, n_samples, horizon = predictions.shape
+
+        # (K, n_series, horizon) — same for every sample.
+        quantile_levels = np.clip(1.0 - self.alpha_t_per_expert_, 0.0, 1.0)
+        thresholds = np.empty((K, n_series, horizon), dtype=np.float64)
+        for k in range(K):
+            thresholds[k] = _per_cell_quantile(self.scores_, quantile_levels[k])
+
+        # Broadcast: predictions[None] is (1, n_series, n_samples, horizon);
+        # thresholds[:, :, None, :] is (K, n_series, 1, horizon).
+        lower_bounds = predictions[None, :, :, :] - thresholds[:, :, None, :]
+        upper_bounds = predictions[None, :, :, :] + thresholds[:, :, None, :]
+        lower_bounds = np.maximum(lower_bounds, self.interval_clip_lower_)
+        upper_bounds = np.minimum(upper_bounds, self.interval_clip_upper_)
+
+        w_lower = self.aggregator_lower_.weights()  # (K, n_series, horizon)
+        w_upper = self.aggregator_upper_.weights()
+        aggregated_lower = (w_lower[:, :, None, :] * lower_bounds).sum(axis=0)
+        aggregated_upper = (w_upper[:, :, None, :] * upper_bounds).sum(axis=0)
+        return np.stack([aggregated_lower, aggregated_upper], axis=-1)
 
     def update(self, prediction: Forecast, truth: Forecast) -> None:
         """
