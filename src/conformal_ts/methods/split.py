@@ -131,6 +131,10 @@ class SplitConformal(ConformalMethod):
         # Fitted state lives on self (sklearn convention: trailing underscore).
         self.score_quantile_: NDArray[np.floating] = np.quantile(scores, quantile_level, axis=1)
         self.n_calibration_samples_: int = n_cal
+        # Retain calibration data for Mode 1 diagnostics. Defensive-copy so
+        # later operations cannot mutate the stored arrays.
+        self.predictions_calibration_: NDArray[np.floating] = predictions.copy()
+        self.truths_calibration_: NDArray[np.floating] = np.asarray(truths, dtype=np.float64).copy()
         self.is_calibrated_ = True
 
         # CalibrationResult is a snapshot — defensively copy mutable arrays so the
@@ -199,3 +203,20 @@ class SplitConformal(ConformalMethod):
             interval=interval,
             alpha=self.alpha,
         )
+
+    def _intervals_from_predictions(self, predictions: Forecast) -> Interval:
+        """
+        Apply the calibrated score quantile to predictions to produce intervals.
+
+        Used by :func:`conformal_ts.diagnostics.evaluate_calibration` to
+        reconstruct in-sample intervals from stored calibration predictions.
+
+        Parameters
+        ----------
+        predictions : Forecast, shape (n_series, n_samples, horizon)
+
+        Returns
+        -------
+        Interval, shape (n_series, n_samples, horizon, 2)
+        """
+        return self.score_fn.invert(predictions, self.score_quantile_)

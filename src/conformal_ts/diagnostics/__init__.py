@@ -17,7 +17,7 @@ from .method_diagnostics import (
     nexcp_state,
     spci_state,
 )
-from .reports import Report, evaluate
+from .reports import Report, evaluate, evaluate_calibration
 from .scoring import (
     coverage_width_summary,
     mean_interval_width,
@@ -49,4 +49,5 @@ __all__ = [
     # Integration
     "Report",
     "evaluate",
+    "evaluate_calibration",
 ]

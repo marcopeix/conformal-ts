@@ -306,6 +306,13 @@ class SequentialPredictiveConformalInference(ConformalMethod):
 
         self.n_calibration_samples_: int = self.residuals_.shape[1]
         self.n_observations_: int = self.residuals_.shape[1]
+        # Retain calibration data for Mode 1 diagnostics. SPCI's stored state
+        # is signed residuals; users still want raw predictions and truths for
+        # in-sample evaluation, so we keep both.
+        self.predictions_calibration_: NDArray[np.floating] = np.asarray(
+            predictions, dtype=np.float64
+        ).copy()
+        self.truths_calibration_: NDArray[np.floating] = np.asarray(truths, dtype=np.float64).copy()
         self._steps_since_refit_: int = 0
         self.is_calibrated_ = True
 
@@ -380,6 +387,37 @@ class SequentialPredictiveConformalInference(ConformalMethod):
 
         interval: Interval = self.score_fn.invert(point, score_thresholds)
         return PredictionResult(point=point, interval=interval, alpha=self.alpha)
+
+    def _intervals_from_predictions(self, predictions: Forecast) -> Interval:
+        """
+        Apply current per-cell offsets to ``predictions`` to produce intervals.
+
+        Used by :func:`conformal_ts.diagnostics.evaluate_calibration`. The
+        regressors and residual buffer are the post-calibration snapshots, and
+        the offsets are computed from the most recent ``window_size``
+        residuals; the same offset pair is reused for every sample. Coverage
+        estimates from this function are in-sample and generally optimistic.
+
+        Parameters
+        ----------
+        predictions : Forecast, shape (n_series, n_samples, horizon)
+
+        Returns
+        -------
+        Interval, shape (n_series, n_samples, horizon, 2)
+        """
+        w = self.window_size
+        n_series, _, horizon = self.residuals_.shape
+
+        score_thresholds = np.empty((n_series, horizon, 2), dtype=np.float64)
+        for s in range(n_series):
+            for h in range(horizon):
+                X_query = self.residuals_[s, -w:, h].reshape(1, w)
+                regressor = self.quantile_regressors_[(s, h)]
+                lower_offset, upper_offset = self._optimize_beta(regressor, X_query)
+                score_thresholds[s, h, 0] = lower_offset
+                score_thresholds[s, h, 1] = upper_offset
+        return self.score_fn.invert(predictions, score_thresholds)
 
     def _optimize_beta(
         self,

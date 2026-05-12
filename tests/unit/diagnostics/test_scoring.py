@@ -47,6 +47,21 @@ class TestWinklerScore:
         scores = winkler_score(interval, truth, alpha=0.1)
         assert (scores >= 0).all()
 
+    def test_saturated_intervals_stay_finite(self) -> None:
+        # Online methods (ACI, AgACI) can produce intervals saturated at the
+        # per-cell quantile sentinel when alpha_t drifts. Width and Winkler
+        # must remain finite under that regime.
+        from conformal_ts.methods._online_helpers import _SATURATION_SENTINEL
+
+        truth = np.zeros((2, 5, 3), dtype=np.float64)
+        lower = np.full_like(truth, -_SATURATION_SENTINEL)
+        upper = np.full_like(truth, _SATURATION_SENTINEL)
+        interval = np.stack([lower, upper], axis=-1)
+        widths = interval[..., 1] - interval[..., 0]
+        assert np.isfinite(widths).all()
+        scores = winkler_score(interval, truth, alpha=0.1)
+        assert np.isfinite(scores).all()
+
     def test_invalid_alpha_raises(self) -> None:
         interval = np.zeros((1, 1, 1, 2))
         truth = np.zeros((1, 1, 1))

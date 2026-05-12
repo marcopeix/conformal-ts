@@ -651,6 +651,71 @@ class TestFittedState:
         assert cal.diagnostics["symmetric"] is True
         assert cal.diagnostics["quantiles_used"] == [0.05, 0.95]
 
+    def test_stores_calibration_data(self) -> None:
+        n_series, horizon = 2, 3
+        adapter = _make_const_quantile_adapter(n_series, horizon)
+        method = ConformalizedQuantileRegression(adapter, alpha=0.1)
+        rng = np.random.default_rng(0)
+        histories = [rng.standard_normal((n_series, 30)) for _ in range(50)]
+        truths = rng.standard_normal((n_series, 50, horizon))
+        method.calibrate(histories, truths)
+
+        assert method.predictions_calibration_.shape == (n_series, 50, horizon)
+        assert method.truths_calibration_.shape == (n_series, 50, horizon)
+        assert method.quantile_predictions_calibration_.shape == (n_series, 50, horizon, 2)
+        # predictions_calibration_ is the midpoint of the quantile predictions.
+        expected_mid = (
+            method.quantile_predictions_calibration_[..., 0]
+            + method.quantile_predictions_calibration_[..., 1]
+        ) / 2.0
+        np.testing.assert_allclose(method.predictions_calibration_, expected_mid)
+
+    def test_calibration_data_is_defensive_copy(self) -> None:
+        adapter = _make_const_quantile_adapter(1, 1)
+        method = ConformalizedQuantileRegression(adapter, alpha=0.1)
+        rng = np.random.default_rng(0)
+        histories = [rng.standard_normal((1, 30)) for _ in range(50)]
+        truths = rng.standard_normal((1, 50, 1))
+        method.calibrate(histories, truths)
+
+        score_quantile_before = method.score_quantile_.copy()
+        method.quantile_predictions_calibration_[...] = 0.0
+        method.truths_calibration_[...] = 0.0
+        np.testing.assert_array_equal(method.score_quantile_, score_quantile_before)
+
+
+class TestIntervalsFromPredictions:
+    def test_uses_stored_quantile_predictions(self) -> None:
+        n_series, horizon = 2, 3
+        adapter = _make_const_quantile_adapter(n_series, horizon)
+        method = ConformalizedQuantileRegression(adapter, alpha=0.1)
+        rng = np.random.default_rng(0)
+        histories = [rng.standard_normal((n_series, 30)) for _ in range(50)]
+        truths = rng.standard_normal((n_series, 50, horizon))
+        method.calibrate(histories, truths)
+
+        intervals = method._intervals_from_predictions(method.predictions_calibration_)
+        expected = method.score_fn.invert(
+            method.quantile_predictions_calibration_, method.score_quantile_
+        )
+        np.testing.assert_allclose(intervals, expected)
+        assert intervals.shape == (n_series, 50, horizon, 2)
+
+    def test_predictions_argument_ignored(self) -> None:
+        # Passing a different (but shape-compatible) predictions array does not
+        # change the result, because CQR uses stored quantile predictions.
+        n_series, horizon = 1, 2
+        adapter = _make_const_quantile_adapter(n_series, horizon)
+        method = ConformalizedQuantileRegression(adapter, alpha=0.1)
+        rng = np.random.default_rng(0)
+        histories = [rng.standard_normal((n_series, 30)) for _ in range(50)]
+        truths = rng.standard_normal((n_series, 50, horizon))
+        method.calibrate(histories, truths)
+
+        a = method._intervals_from_predictions(method.predictions_calibration_)
+        b = method._intervals_from_predictions(np.zeros_like(method.predictions_calibration_))
+        np.testing.assert_allclose(a, b)
+
 
 # ---------------------------------------------------------------------------
 # CV fast path

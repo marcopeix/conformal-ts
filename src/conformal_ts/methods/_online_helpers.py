@@ -21,6 +21,15 @@ from numpy.typing import NDArray
 from ..base import Forecast
 
 
+# Sentinel for "saturated" quantile thresholds. Chosen as 1e300 rather than
+# np.finfo(np.float64).max so downstream arithmetic — interval widths
+# (`upper - lower`) and Winkler penalties (`(2/alpha) * gap`) — stays inside
+# float64 range instead of overflowing to +inf. Any value much smaller than
+# the float64 limit (~1.8e308) but large enough to dominate realistic scores
+# works; 1e300 keeps two orders of magnitude of arithmetic headroom.
+_SATURATION_SENTINEL: float = 1e300
+
+
 def _per_cell_quantile(
     scores: NDArray[np.floating],
     quantile_levels: NDArray[np.floating],
@@ -39,8 +48,8 @@ def _per_cell_quantile(
     -------
     NDArray, shape (n_series, horizon)
         ``out[s, h] = np.quantile(scores[s, :, h], quantile_levels[s, h])``
-        with saturation at the level boundaries (``ql >= 1`` → ``+max float``;
-        ``ql <= 0`` → ``-max float``).
+        with saturation at the level boundaries (``ql >= 1`` →
+        ``+_SATURATION_SENTINEL``; ``ql <= 0`` → ``-_SATURATION_SENTINEL``).
 
     Notes
     -----
@@ -55,9 +64,9 @@ def _per_cell_quantile(
         for h in range(horizon):
             ql = float(quantile_levels[s, h])
             if ql >= 1.0:
-                out[s, h] = np.finfo(np.float64).max
+                out[s, h] = _SATURATION_SENTINEL
             elif ql <= 0.0:
-                out[s, h] = -np.finfo(np.float64).max
+                out[s, h] = -_SATURATION_SENTINEL
             else:
                 out[s, h] = float(np.quantile(scores[s, :, h], ql))
     return out

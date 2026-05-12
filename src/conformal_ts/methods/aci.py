@@ -272,6 +272,11 @@ class AdaptiveConformalInference(ConformalMethod):
         self.scores_: NDArray[np.floating] = all_scores
         self.n_calibration_samples_: int = n_cal
         self.n_observations_: int = n_cal
+        # Retain calibration data for Mode 1 diagnostics.
+        self.predictions_calibration_: NDArray[np.floating] = np.asarray(
+            predictions, dtype=np.float64
+        ).copy()
+        self.truths_calibration_: NDArray[np.floating] = np.asarray(truths, dtype=np.float64).copy()
         self.is_calibrated_ = True
 
     # ------------------------------------------------------------------
@@ -320,6 +325,27 @@ class AdaptiveConformalInference(ConformalMethod):
         interval: Interval = self.score_fn.invert(point, threshold)
 
         return PredictionResult(point=point, interval=interval, alpha=self.alpha)
+
+    def _intervals_from_predictions(self, predictions: Forecast) -> Interval:
+        """
+        Apply the current ``alpha_t_`` to predictions to produce intervals.
+
+        Used by :func:`conformal_ts.diagnostics.evaluate_calibration`. The
+        threshold is derived from the **post-calibration** ``alpha_t_`` and
+        the full score history, not the time-varying state that existed at
+        each calibration step. As a result, coverage estimates from this
+        function are in-sample and generally optimistic.
+
+        Parameters
+        ----------
+        predictions : Forecast, shape (n_series, n_samples, horizon)
+
+        Returns
+        -------
+        Interval, shape (n_series, n_samples, horizon, 2)
+        """
+        threshold = self._current_threshold()
+        return self.score_fn.invert(predictions, threshold)
 
     def update(self, prediction: Forecast, truth: Forecast) -> None:
         """

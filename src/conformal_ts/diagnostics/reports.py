@@ -1,4 +1,4 @@
-"""End-to-end holdout evaluation: ``evaluate`` and the ``Report`` dataclass."""
+"""End-to-end evaluation: ``evaluate``, ``evaluate_calibration``, ``Report``."""
 
 from __future__ import annotations
 
@@ -22,7 +22,7 @@ from .scoring import mean_interval_width, winkler_score
 @dataclass
 class Report:
     """
-    Output of :func:`evaluate`.
+    Output of :func:`evaluate` and :func:`evaluate_calibration`.
 
     Carries Layer 1 (generic) coverage and scoring metrics plus Layer 2
     (method-specific) state, along with the raw intervals/truths/points for
@@ -90,6 +90,48 @@ class Report:
             )
 
         return "\n".join(lines)
+
+
+def _build_report(
+    *,
+    method_name: str,
+    alpha: float,
+    intervals: NDArray[np.floating],
+    truths: NDArray[np.floating],
+    points: NDArray[np.floating],
+    state: dict[str, Any],
+) -> Report:
+    """
+    Compute Layer 1 metrics on ``(intervals, truths)`` and wrap into a Report.
+
+    Shared between :func:`evaluate` (Mode 2) and :func:`evaluate_calibration`
+    (Mode 1) — both produce the same Report structure from the same kind of
+    inputs; only the data source differs.
+    """
+    cov_marginal = marginal_coverage(intervals, truths)
+    cov_h = coverage_by_horizon(intervals, truths)
+    cov_s = coverage_by_series(intervals, truths)
+    cov_cell = coverage_per_cell(intervals, truths)
+
+    width_per_cell = mean_interval_width(intervals)
+    mean_width = float(width_per_cell.mean())
+    mean_winkler = float(winkler_score(intervals, truths, alpha).mean())
+
+    return Report(
+        method_name=method_name,
+        alpha=alpha,
+        n_holdout_samples=intervals.shape[1],
+        marginal_coverage=cov_marginal,
+        coverage_by_horizon=cov_h,
+        coverage_by_series=cov_s,
+        coverage_per_cell=cov_cell,
+        mean_interval_width=mean_width,
+        mean_winkler_score=mean_winkler,
+        method_state=state,
+        intervals=intervals,
+        truths=truths,
+        points=points,
+    )
 
 
 def evaluate(
@@ -170,29 +212,87 @@ def evaluate(
     points_arr = np.concatenate(point_list, axis=1)
     intervals_arr = np.concatenate(interval_list, axis=1)
 
-    cov_marginal = marginal_coverage(intervals_arr, truths_arr)
-    cov_h = coverage_by_horizon(intervals_arr, truths_arr)
-    cov_s = coverage_by_series(intervals_arr, truths_arr)
-    cov_cell = coverage_per_cell(intervals_arr, truths_arr)
-
-    width_per_cell = mean_interval_width(intervals_arr)
-    mean_width = float(width_per_cell.mean())
-    mean_winkler = float(winkler_score(intervals_arr, truths_arr, method.alpha).mean())
-
-    state = method_state(method)
-
-    return Report(
+    return _build_report(
         method_name=type(method).__name__,
         alpha=float(method.alpha),
-        n_holdout_samples=n_holdout,
-        marginal_coverage=cov_marginal,
-        coverage_by_horizon=cov_h,
-        coverage_by_series=cov_s,
-        coverage_per_cell=cov_cell,
-        mean_interval_width=mean_width,
-        mean_winkler_score=mean_winkler,
-        method_state=state,
         intervals=intervals_arr,
         truths=truths_arr,
         points=points_arr,
+        state=method_state(method),
+    )
+
+
+def evaluate_calibration(method: ConformalMethod) -> Report:
+    """
+    Compute diagnostics using the method's stored calibration data (Mode 1).
+
+    Reconstructs the intervals that would have been produced during
+    calibration (using the method's final fitted state applied to the
+    calibration predictions), then runs Mode 2-style diagnostics on those
+    intervals against the calibration truths.
+
+    This differs from :func:`evaluate` in two ways:
+
+    1. No holdout is required — uses stored calibration data.
+    2. For online methods, the intervals are reconstructed using the method's
+       **final** fitted state, not the time-varying state during calibration.
+       This is in-sample evaluation; coverage estimates here are optimistic
+       compared to true out-of-sample performance.
+
+    Parameters
+    ----------
+    method : ConformalMethod
+        Must be calibrated, with ``predictions_calibration_`` and
+        ``truths_calibration_`` attributes populated.
+
+    Returns
+    -------
+    Report
+        Same shape as the report from :func:`evaluate`. The ``method_name``
+        field is suffixed with ``" (calibration)"`` to make the data source
+        clear.
+
+    Raises
+    ------
+    CalibrationError
+        If ``method.is_calibrated_`` is False.
+    RuntimeError
+        If ``predictions_calibration_`` or ``truths_calibration_`` attributes
+        are missing (e.g., a custom method that doesn't follow the retrofit
+        convention), or if ``method`` does not implement
+        ``_intervals_from_predictions``.
+    """
+    if not getattr(method, "is_calibrated_", False):
+        raise CalibrationError(
+            "evaluate_calibration() called on an uncalibrated method. Call calibrate() first."
+        )
+    if not hasattr(method, "predictions_calibration_"):
+        raise RuntimeError(
+            f"{type(method).__name__} does not expose predictions_calibration_. "
+            "Ensure the method's calibrate() populates this attribute."
+        )
+    if not hasattr(method, "truths_calibration_"):
+        raise RuntimeError(
+            f"{type(method).__name__} does not expose truths_calibration_. "
+            "Ensure the method's calibrate() populates this attribute."
+        )
+    if not hasattr(method, "_intervals_from_predictions"):
+        raise RuntimeError(
+            f"{type(method).__name__} does not implement "
+            "_intervals_from_predictions; cannot reconstruct in-sample "
+            "intervals."
+        )
+
+    predictions = np.asarray(method.predictions_calibration_, dtype=np.float64)
+    truths = np.asarray(method.truths_calibration_, dtype=np.float64)
+
+    intervals = np.asarray(method._intervals_from_predictions(predictions), dtype=np.float64)
+
+    return _build_report(
+        method_name=f"{type(method).__name__} (calibration)",
+        alpha=float(method.alpha),
+        intervals=intervals,
+        truths=truths,
+        points=predictions,
+        state=method_state(method),
     )

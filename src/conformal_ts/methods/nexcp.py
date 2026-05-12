@@ -13,6 +13,7 @@ from ..base import (
     ConformalMethod,
     Forecast,
     ForecasterAdapter,
+    Interval,
     PredictionResult,
     ScoreFunction,
     Series,
@@ -214,6 +215,11 @@ class NonexchangeableConformalPrediction(ConformalMethod):
         self.score_quantile_: NDArray[np.floating] = self._compute_weighted_quantile(
             self.scores_, self.rho, self.alpha
         )
+        # Retain calibration data for Mode 1 diagnostics.
+        self.predictions_calibration_: NDArray[np.floating] = np.asarray(
+            predictions, dtype=np.float64
+        ).copy()
+        self.truths_calibration_: NDArray[np.floating] = np.asarray(truths, dtype=np.float64).copy()
         self.is_calibrated_ = True
 
     def _effective_sample_size(self, n: int) -> float:
@@ -342,6 +348,23 @@ class NonexchangeableConformalPrediction(ConformalMethod):
         point: Forecast = self.forecaster.predict(history)
         interval = self.score_fn.invert(point, self.score_quantile_)
         return PredictionResult(point=point, interval=interval, alpha=self.alpha)
+
+    def _intervals_from_predictions(self, predictions: Forecast) -> Interval:
+        """
+        Apply the calibrated weighted-quantile threshold to predictions.
+
+        Used by :func:`conformal_ts.diagnostics.evaluate_calibration` to
+        reconstruct in-sample intervals from stored calibration predictions.
+
+        Parameters
+        ----------
+        predictions : Forecast, shape (n_series, n_samples, horizon)
+
+        Returns
+        -------
+        Interval, shape (n_series, n_samples, horizon, 2)
+        """
+        return self.score_fn.invert(predictions, self.score_quantile_)
 
     def update(self, prediction: Forecast, truth: Forecast) -> None:
         """

@@ -243,6 +243,14 @@ class ConformalizedQuantileRegression(ConformalMethod):
 
         self.score_quantile_: NDArray[np.floating] = np.quantile(scores, quantile_level, axis=1)
         self.n_calibration_samples_: int = n_cal
+        # Retain calibration data for Mode 1 diagnostics. CQR's "prediction"
+        # is a quantile pair; store both the full quantile predictions and
+        # the midpoint (the natural point-forecast equivalent).
+        self.quantile_predictions_calibration_: NDArray[np.floating] = quantile_predictions.copy()
+        self.predictions_calibration_: NDArray[np.floating] = (
+            quantile_predictions[..., 0] + quantile_predictions[..., 1]
+        ) / 2.0
+        self.truths_calibration_: NDArray[np.floating] = truths_arr.copy()
         self.is_calibrated_ = True
 
         return CalibrationResult(
@@ -293,6 +301,14 @@ class ConformalizedQuantileRegression(ConformalMethod):
 
         self.score_quantile_ = np.quantile(scores, quantile_level, axis=1)
         self.n_calibration_samples_ = n_windows
+        self.quantile_predictions_calibration_ = np.asarray(
+            quantile_predictions, dtype=np.float64
+        ).copy()
+        self.predictions_calibration_ = (
+            self.quantile_predictions_calibration_[..., 0]
+            + self.quantile_predictions_calibration_[..., 1]
+        ) / 2.0
+        self.truths_calibration_ = np.asarray(truths, dtype=np.float64).copy()
         self.is_calibrated_ = True
 
         return CalibrationResult(
@@ -342,3 +358,35 @@ class ConformalizedQuantileRegression(ConformalMethod):
         interval: Interval = self.score_fn.invert(q_pred_reshaped, self.score_quantile_)
 
         return PredictionResult(point=point, interval=interval, alpha=self.alpha)
+
+    def _intervals_from_predictions(self, predictions: Forecast) -> Interval:
+        """
+        Apply the calibrated score quantile to the stored calibration quantile
+        predictions.
+
+        Note that ``predictions`` is **ignored** — CQR's score function is
+        defined on quantile pairs, so in-sample evaluation must use the stored
+        ``quantile_predictions_calibration_`` rather than the midpoint
+        forecasts. The argument is kept for interface consistency with the
+        other methods' ``_intervals_from_predictions``.
+
+        Parameters
+        ----------
+        predictions : Forecast, shape (n_series, n_samples, horizon)
+            Ignored. The stored quantile predictions are used instead.
+
+        Returns
+        -------
+        Interval, shape (n_series, n_calibration_samples, horizon, 2)
+
+        Raises
+        ------
+        RuntimeError
+            If ``quantile_predictions_calibration_`` is missing.
+        """
+        if not hasattr(self, "quantile_predictions_calibration_"):
+            raise RuntimeError(
+                "ConformalizedQuantileRegression requires "
+                "quantile_predictions_calibration_ for in-sample evaluation."
+            )
+        return self.score_fn.invert(self.quantile_predictions_calibration_, self.score_quantile_)
