@@ -1,0 +1,100 @@
+site_name: conformal-ts
+site_description: Adaptive conformal prediction for time series forecasting
+site_url: https://conformal-ts.readthedocs.io/
+repo_url: https://github.com/marcopeix/conformal-ts
+repo_name: marcopeix/conformal-ts
+edit_uri: edit/main/docs/
+
+theme:
+  name: material
+  features:
+    - navigation.tabs
+    - navigation.sections
+    - navigation.expand
+    - navigation.top
+    - navigation.indexes
+    - search.suggest
+    - search.highlight
+    - content.code.copy
+    - content.code.annotate
+    - content.tabs.link
+  palette:
+    - media: "(prefers-color-scheme: light)"
+      scheme: default
+      primary: indigo
+      accent: indigo
+      toggle:
+        icon: material/brightness-7
+        name: Switch to dark mode
+    - media: "(prefers-color-scheme: dark)"
+      scheme: slate
+      primary: indigo
+      accent: indigo
+      toggle:
+        icon: material/brightness-4
+        name: Switch to light mode
+  icon:
+    repo: fontawesome/brands/github
+
+markdown_extensions:
+  - admonition
+  - pymdownx.details
+  - pymdownx.superfences
+  - pymdownx.highlight:
+      anchor_linenums: true
+  - pymdownx.inlinehilite
+  - pymdownx.snippets
+  - pymdownx.tabbed:
+      alternate_style: true
+  - pymdownx.arithmatex:
+      generic: true
+  - attr_list
+  - md_in_html
+  - toc:
+      permalink: true
+
+extra_javascript:
+  - https://polyfill.io/v3/polyfill.min.js?features=es6
+  - https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js
+
+plugins:
+  - search
+  - mkdocstrings:
+      handlers:
+        python:
+          paths: [src]
+          options:
+            docstring_style: numpy
+            docstring_section_style: list
+            show_source: true
+            show_root_heading: true
+            show_root_full_path: false
+            show_signature_annotations: true
+            separate_signature: true
+            show_symbol_type_heading: true
+            show_symbol_type_toc: true
+            merge_init_into_class: true
+            members_order: source
+            filters: ["!^_"]
+
+nav:
+  - Home: index.md
+  - Quickstart: quickstart.md
+  - Installation: installation.md
+  - Concepts: concepts.md
+  - Methods:
+    - methods/index.md
+    - Split Conformal: methods/split.md
+    - CQR: methods/cqr.md
+    - ACI: methods/aci.md
+    - AgACI: methods/agaci.md
+    - NexCP: methods/nexcp.md
+    - SPCI: methods/spci.md
+  - Adapters:
+    - adapters/index.md
+    - StatsForecast: adapters/statsforecast.md
+    - MLForecast: adapters/mlforecast.md
+    - NeuralForecast: adapters/neuralforecast.md
+    - Callable: adapters/callable.md
+  - Diagnostics: diagnostics.md
+  - API Reference: api/index.md

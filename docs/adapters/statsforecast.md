@@ -1,3 +1,3 @@
-# Quickstart
+# StatsForecast
 
 *Documentation for this section is in progress.*
